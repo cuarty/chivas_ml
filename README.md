@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Chivas ML — Monitoreo de Carga Física
 
 Proyecto final — **Nicolás Di Bartolo**
@@ -58,3 +59,7 @@ git add .gitattributes
 ```
 
 ---
+=======
+# chivas-ml
+Sistema de análisis de carga física y rendimiento para fútbol profesional. Incluye Data Warehouse, dashboards en Power BI y un modelo de Machine Learning con datos GPS WIMU, desarrollado en conjunto con el preparador físico del Club Chivas de Guadalajara.
+>>>>>>> e829c2a (Initial commit)

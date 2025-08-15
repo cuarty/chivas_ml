@@ -8,18 +8,25 @@ __pycache__/
 dist/
 build/
 
-# Datos
-data/raw/*
-!data/chivas_dw.sqlite
+# IDE / Editores
+.vscode/
+.idea/
 
-# Power BI / binarios pesados (usar LFS)
-*.pbix
-*.pptx
-
-# Sistemas
+# SO
 .DS_Store
 Thumbs.db
 
-# VSCode / IDE
-.vscode/
-.idea/
+# Datos (ignorá crudo/externos/interim/tmp)
+data/raw/**
+data/external/**
+data/interim/**
+data/tmp/**
+# Excepción para guardar la DB consolidada
+!data/external/chivas_dw.sqlite
+
+# Binarios pesados (usar LFS si hiciera falta)
+*.pbix
+*.pptx
+
+# Windows device ghost
+NUL
