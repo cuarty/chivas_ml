@@ -1,0 +1,25 @@
+# Entorno / Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+*.egg-info/
+dist/
+build/
+
+# Datos
+data/raw/*
+!data/chivas_dw.sqlite
+
+# Power BI / binarios pesados (usar LFS)
+*.pbix
+*.pptx
+
+# Sistemas
+.DS_Store
+Thumbs.db
+
+# VSCode / IDE
+.vscode/
+.idea/
