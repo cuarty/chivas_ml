@@ -16,15 +16,24 @@ build/
 .DS_Store
 Thumbs.db
 
+<<<<<<< HEAD
 # Datos (ignorá crudo/externos/interim/tmp)
+=======
+# Datos (ignorá crudo y derivados pesados)
+>>>>>>> 180286a (Estado final limpio: .gitignore en raíz, excluyo .venv/NUL y datos crudos)
 data/raw/**
 data/external/**
 data/interim/**
 data/tmp/**
+<<<<<<< HEAD
 # Excepción para guardar la DB consolidada
 !data/external/chivas_dw.sqlite
 
 # Binarios pesados (usar LFS si hiciera falta)
+=======
+
+# Binarios pesados (usar LFS si hace falta)
+>>>>>>> 180286a (Estado final limpio: .gitignore en raíz, excluyo .venv/NUL y datos crudos)
 *.pbix
 *.pptx
 
