@@ -31,6 +31,8 @@ def inicializar_etl(rutas):
     calendario = rutas['CAL_PARTIDOS'] if rutas['CAL_PARTIDOS'].exists() else None
     return ETLChivas(ruta_sqlite=rutas['DB_PATH'], calendario_partidos_xlsx=calendario)
 
+
+
 def cargar_jugadores(etl, jugadores_xlsx):
     """Carga los jugadores en la base de datos con verificación"""
     if not jugadores_xlsx.exists():
@@ -88,10 +90,17 @@ def main():
     
     # 2. Mostrar estructura de archivos (debug)
     mostrar_encabezados(rutas['RAW_DIR'])
+
+    # En main.py, antes de procesar partidos:
+    etl.cargar_calendario_partidos(rutas['CAL_PARTIDOS'])
     
     # 3. Cargar jugadores (verificación exhaustiva)
     if not cargar_jugadores(etl, rutas['JUGADORES_XLSX']):
         return  # Terminar si no hay jugadores
+
+    # En main.py, antes de procesar
+    etl.validar_aliases()
+
     
     # 4. Procesar entrenamientos
     resultado_entrenos = procesar_entrenamientos(etl, rutas['RAW_DIR'])
@@ -102,8 +111,14 @@ def main():
     n_partidos = procesar_partidos(etl, rutas['PARTIDOS_MASTER'])
     print(f"\n[RESUMEN] Partidos actualizados: {n_partidos}")
 
+    
+
     # En main.py, antes de procesar
     etl.validar_aliases()
+
+    etl.consolidar_rivales()                  # fusiona duplicados
+    etl.estandarizar_rival_display_mayusculas()  # pone MAYÚSCULAS en DB_Partidos
+
     
     # 6. Resumen final
     with etl._conectar() as conn:
