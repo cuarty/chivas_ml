@@ -15,17 +15,24 @@ def configurar_rutas():
     return {
         'DB_PATH': HERE / "data" / "external" / "chivas_dw.sqlite",
         'RAW_DIR': HERE / "data" / "raw",
+        'RAW_ENTRENAMIENTOS': HERE / "data" / "raw" / "entrenamientos",
+        'RAW_PARTIDOS': HERE / "data" / "raw" / "partidos",
         'REF_DIR': HERE / "data" / "ref",
         'CAL_PARTIDOS': HERE / "data" / "ref" / "calendario_partidos.xlsx",
         'JUGADORES_XLSX': HERE / "data" / "ref" / "DB_Jugadores.xlsx",
+        # soporte legacy: si tenés un “master” único seguí usándolo (opcional)
         'PARTIDOS_MASTER': HERE / "data" / "ref" / "partidos_jugados.xlsx"
     }
+
 
 def inicializar_etl(rutas):
     """Inicializa la instancia ETL y asegura estructura de directorios"""
     # Crear directorios si no existen
     rutas['DB_PATH'].parent.mkdir(parents=True, exist_ok=True)
     rutas['RAW_DIR'].mkdir(parents=True, exist_ok=True)
+    rutas['RAW_ENTRENAMIENTOS'].mkdir(parents=True, exist_ok=True)
+    rutas['RAW_PARTIDOS'].mkdir(parents=True, exist_ok=True)
+
     
     # Instanciar ETL
     calendario = rutas['CAL_PARTIDOS'] if rutas['CAL_PARTIDOS'].exists() else None
@@ -69,18 +76,40 @@ def procesar_partidos(etl, partidos_master):
     print("\n[INFO] Procesando partidos desde archivo maestro...")
     return etl.cargar_partidos_desde_master(partidos_master)
 
-def mostrar_encabezados(raw_dir):
-    """Muestra los encabezados de los archivos raw para debug"""
-    print("\n[DEBUG] Encabezados en data/raw:")
-    for p in sorted(raw_dir.glob("*.xlsx")):
+def mostrar_encabezados(dir_entrenos, dir_partidos):
+    def _dump(d, titulo):
+        print(f"\n[DEBUG] Encabezados en {titulo}:")
+        for p in sorted(d.glob("*.xlsx")):
+            if p.name.startswith('~$'):
+                continue
+            try:
+                df_tmp = pd.read_excel(p, nrows=2)
+                print(f"  - {p.name}: {list(df_tmp.columns)}")
+            except Exception as e:
+                print(f"  - {p.name}: ERROR -> {e}")
+    _dump(dir_entrenos, "data/raw/entrenamientos")
+    _dump(dir_partidos, "data/raw/partidos")
+
+
+def procesar_entrenamientos_dir(etl, dir_entrenos: Path):
+    if not dir_entrenos.exists():
+        print(f"[WARN] No se encontró {dir_entrenos}")
+        return {'entrenamientos': 0, 'filas_rendimiento_semanal': 0}
+    print("\n[INFO] Procesando ENTRENAMIENTOS (carpeta completa)…")
+    return etl.procesar_carpeta(dir_entrenos)  # ya separa y carga entrenos
+
+
+def procesar_partidos_dir(etl, dir_partidos: Path):
+    if not dir_partidos.exists():
+        print(f"[WARN] No se encontró {dir_partidos}")
+        return 0
+    print("\n[INFO] Procesando PARTIDOS (carpeta completa)…")
+    n_total = 0
+    for p in sorted(dir_partidos.glob("*.xlsx")):
         if p.name.startswith('~$'):
             continue
-        try:
-            df_tmp = pd.read_excel(p, nrows=2)
-            print(f"  - {p.name}: {list(df_tmp.columns)}")
-        except Exception as e:
-            print(f"  - {p.name}: ERROR -> {e}")
-
+        n_total += etl.cargar_partidos_desde_master(p)  # reutilizamos tu loader robusto
+    return n_total
 
 
 def main():
@@ -89,7 +118,8 @@ def main():
     etl = inicializar_etl(rutas)
     
     # 2. Mostrar estructura de archivos (debug)
-    mostrar_encabezados(rutas['RAW_DIR'])
+    mostrar_encabezados(rutas['RAW_ENTRENAMIENTOS'], rutas['RAW_PARTIDOS'])
+
 
     # En main.py, antes de procesar partidos:
     etl.cargar_calendario_partidos(rutas['CAL_PARTIDOS'])
@@ -102,14 +132,20 @@ def main():
     etl.validar_aliases()
 
     
-    # 4. Procesar entrenamientos
-    resultado_entrenos = procesar_entrenamientos(etl, rutas['RAW_DIR'])
+    # 4. ENTRENAMIENTOS (carpeta)
+    resultado_entrenos = procesar_entrenamientos_dir(etl, rutas['RAW_ENTRENAMIENTOS'])
     print(f"\n[RESUMEN] Entrenamientos procesados: {resultado_entrenos['entrenamientos']}")
     print(f"[RESUMEN] Semanal actualizado: {resultado_entrenos['filas_rendimiento_semanal']}")
-    
-    # 5. Procesar partidos
-    n_partidos = procesar_partidos(etl, rutas['PARTIDOS_MASTER'])
-    print(f"\n[RESUMEN] Partidos actualizados: {n_partidos}")
+
+    # 5. PARTIDOS (carpeta)
+    n_partidos = procesar_partidos_dir(etl, rutas['RAW_PARTIDOS'])
+    print(f"\n[RESUMEN] Partidos actualizados (carpeta): {n_partidos}")
+
+    # (opcional, soporte legacy si seguís usando un master único además de la carpeta)
+    if rutas['PARTIDOS_MASTER'].exists():
+        print("\n[INFO] Procesando PARTIDOS desde master legacy…")
+        n_partidos += procesar_partidos(etl, rutas['PARTIDOS_MASTER'])
+        print(f"[RESUMEN] Partidos total (carpeta + master): {n_partidos}")
 
     
 

@@ -59,6 +59,8 @@ import unicodedata
 import re
 import traceback
 from fuzzywuzzy import fuzz, process
+from datetime import datetime
+import shutil
 
 
 
@@ -206,6 +208,45 @@ class ETLChivas:
             CREATE INDEX IF NOT EXISTS idx_rend_semanal_jugador_fecha
                 ON Rendimiento_Semanal(id_jugador, Fecha);
             """)
+
+
+    def _dir_processed(self) -> Path:
+        # data/external/chivas_dw.sqlite -> BASE=data ; processed=BASE/processed
+        return self.ruta_sqlite.parent.parent / "processed"
+
+    def _archivar_archivo(self, src: Path, tipo: str, fecha_ref=None):
+        """
+        Mueve el archivo a data/processed/<tipo>/AAAA-MM-DD_nombre.xlsx.
+        - fecha_ref: date o str 'AAAA-MM-DD' (si no viene, usa mtime del archivo)
+        - evita sobreescrituras agregando sufijo _1, _2, ...
+        """
+        base = self._dir_processed()
+        destino_dir = base / tipo
+        destino_dir.mkdir(parents=True, exist_ok=True)
+
+        if fecha_ref is None:
+            ts = datetime.fromtimestamp(src.stat().st_mtime)
+            fecha_str = ts.strftime("%Y-%m-%d")
+        else:
+            if isinstance(fecha_ref, str):
+                fecha_str = fecha_ref
+            else:
+                fecha_str = datetime.strptime(str(fecha_ref), "%Y-%m-%d").strftime("%Y-%m-%d")
+
+        nombre_final = f"{fecha_str}_{src.name}"
+        destino = destino_dir / nombre_final
+
+        # Evitar pisar archivos si el mismo nombre ya existe
+        if destino.exists():
+            stem = destino.stem
+            suf = 1
+            while destino.exists():
+                destino = destino_dir / f"{stem}_{suf}{destino.suffix}"
+                suf += 1
+
+        shutil.move(str(src), str(destino))
+        print(f"[ARCHIVO] Movido a {destino.relative_to(self.ruta_sqlite.parent.parent)}")
+
 
     def _get_aliases_rivales_map(self):
         import pandas as pd
@@ -559,6 +600,18 @@ class ETLChivas:
         con.close()
         return rid
 
+
+    def procesar_carpeta_partidos(self, dir_partidos: Path) -> int:
+        dir_partidos = Path(dir_partidos)
+        n_total = 0
+        for archivo in sorted(dir_partidos.glob("*.xlsx")):
+            if archivo.name.startswith("~$"):
+                continue
+            try:
+                n_total += self.cargar_partidos_desde_master(archivo)
+            except Exception as e:
+                print(f"[ERROR] Falló {archivo.name}: {e}")
+        return n_total
 
 
 
@@ -1528,6 +1581,25 @@ class ETLChivas:
                 print(f"[INFO] Registros problemáticos guardados en {ruta_problem}")
             
             print(f"[SUCCESS] Archivo {ruta_xlsx.name} procesado: {resultado}")
+
+            # Elegimos una fecha de referencia para el nombre del archivo
+            # Si detectamos entrenos, usamos la fecha máxima procesada; si no, queda None y se usa mtime.
+            try:
+                fecha_ref = None
+                # si se separaron entrenos/partidos en este flujo, tomamos la última fecha de entrenos cargados
+                # (en este método ya hiciste upsert de entrenos y quizá recálculo semanal)
+                # Recuperamos una mejor pista desde df si existe columna Fecha
+                if "Fecha" in df.columns and not df["Fecha"].isna().all():
+                    fmax = pd.to_datetime(df["Fecha"], errors="coerce").dropna()
+                    if not fmax.empty:
+                        fecha_ref = fmax.max().date().isoformat()
+            except Exception:
+                fecha_ref = None
+
+            # Archivar sólo si hubo algo de entrenamientos o semanal (para no archivar si falló todo)
+            if (resultado.get('entrenamientos', 0) > 0) or (resultado.get('filas_rendimiento_semanal', 0) > 0):
+                self._archivar_archivo(ruta_xlsx, "entrenamientos", fecha_ref)
+
             return resultado
 
         except PermissionError as e:
@@ -1536,8 +1608,7 @@ class ETLChivas:
             print(f"[ERROR] Error de validación: {e}")
         except Exception as e:
             print(f"[ERROR] Error inesperado: {str(e)}")
-            traceback.print_exc()
-        
+            traceback.print_exc()        
         return resultado
 
 
@@ -1738,6 +1809,21 @@ class ETLChivas:
             # 14) Un (1) UPSERT y listo
             n = self.upsert_partidos(df_valido)
             print(f"[SUCCESS] Partidos cargados: {n}")
+
+            # Fecha de referencia para el nombre; si hay varias, uso la mínima
+            try:
+                fecha_ref = None
+                if "Fecha" in df_valido.columns and not df_valido["Fecha"].isna().all():
+                    fmin = pd.to_datetime(df_valido["Fecha"], errors="coerce").dropna()
+                    if not fmin.empty:
+                        fecha_ref = fmin.min().date().isoformat()
+            except Exception:
+                fecha_ref = None
+
+            # Archivar sólo si cargamos al menos un partido
+            if n and n > 0:
+                self._archivar_archivo(ruta_excel, "partidos", fecha_ref)
+
             return n
 
             
