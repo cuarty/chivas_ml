@@ -262,17 +262,37 @@ COLUMNAS_NUMERICAS = [
     "Minutos_jugados", "id_rival",
 ]
 
-_PESOS_POR_POSICION = {
-        #        CE,   CS,   CR
-        "Arquero":   (0.45, 0.35, 0.20),
-        "Defensa":   (0.40, 0.45, 0.15),
-        "Medio":     (0.45, 0.40, 0.15),
-        "Delantera": (0.55, 0.35, 0.10),
-        # fallback si no hay posición
-        "_default":  (0.45, 0.40, 0.15),
-    }
 
-STOP_RIVAL = {"fc", "cf", "club", "deportivo", "cd", "c"}  # c. juarez -> juarez
+
+
+def _leer_excel_robusto(ruta):
+    """
+    Lee .xlsx con openpyxl y .xls (97-2003) con xlrd automáticamente.
+    También soporta .csv por comodidad.
+    """
+    ruta = Path(ruta)
+    suf = ruta.suffix.lower()
+
+    if suf == ".csv":
+        return pd.read_csv(ruta)
+
+    if suf == ".xlsx":
+        # .xlsx -> openpyxl
+        return pd.read_excel(ruta, engine="openpyxl")
+
+    if suf == ".xls":
+        # .xls (97-2003) -> xlrd
+        # requiere tener xlrd instalado en el venv
+        return pd.read_excel(ruta, engine="xlrd")
+
+    # fallback (por si hay extensiones raras)
+    try:
+        return pd.read_excel(ruta)  # que pandas intente elegir engine
+    except Exception as e:
+        raise RuntimeError(
+            f"No pude leer {ruta.name}. Si es .xls, asegurate de tener xlrd instalado. "
+            f"Detalle: {e}"
+        )
 
 
 # ============================================================
@@ -321,6 +341,23 @@ class ETLChivas:
             CREATE INDEX IF NOT EXISTS idx_rend_semanal_jugador_fecha
                 ON Rendimiento_Semanal(id_jugador, Fecha);
             """)
+
+
+
+# --- Constantes de clase  ---
+
+    _PESOS_POR_POSICION = {
+            #        CE,   CS,   CR
+            "Arquero":   (0.45, 0.35, 0.20),
+            "Defensa":   (0.40, 0.45, 0.15),
+            "Medio":     (0.45, 0.40, 0.15),
+            "Delantera": (0.55, 0.35, 0.10),
+            # fallback si no hay posición
+            "_default":  (0.45, 0.40, 0.15),
+        }
+
+    STOP_RIVAL = {"fc", "cf", "club", "deportivo", "cd", "c"}  # c. juarez -> juarez
+
 
 # ============================================================
 # 4- Rutas y archivado post-proceso
@@ -686,6 +723,57 @@ class ETLChivas:
         except Exception:
             return None
 
+    def _parsear_fecha_wimu(self, serie: pd.Series) -> pd.Series:
+        """
+        Convierte fechas provenientes de WIMU:
+        - "Sat Jun 28 17:32:38 UTC 2025"  -> match específico
+        - datetimes ya parseados           -> .dt.date
+        - inferencia general               -> to_datetime(..., infer_datetime_format=True)
+        - seriales de Excel (44927, etc.)  -> origin='1899-12-30'
+        Devuelve objeto date (no datetime).
+        """
+        if serie is None or len(serie) == 0:
+            return pd.to_datetime(serie, errors="coerce").dt.date
+
+        s = serie.copy()
+
+        # 0) si ya viene como datetime
+        if pd.api.types.is_datetime64_any_dtype(s):
+            return pd.to_datetime(s, errors="coerce", utc=True).dt.tz_localize(None).dt.date
+
+        # 1) intento con el formato WIMU explícito
+        dt = pd.to_datetime(
+            s.astype(str),
+            format="%a %b %d %H:%M:%S UTC %Y",
+            errors="coerce",
+            utc=True,
+        ).dt.tz_localize(None)
+
+        # 2) inferencia para los que quedaron NaT
+        faltan = dt.isna()
+        if faltan.any():
+            dt.loc[faltan] = pd.to_datetime(
+                s[faltan].astype(str),
+                errors="coerce",
+                utc=True,
+                infer_datetime_format=True,
+            ).dt.tz_localize(None)
+
+        # 3) seriales de Excel (numéricos)
+        faltan = dt.isna()
+        if faltan.any():
+            # intentar convertir a float por si vienen como texto "44927"
+            ser_num = pd.to_numeric(s[faltan], errors="coerce")
+            dt.loc[faltan] = pd.to_datetime(
+                ser_num,
+                unit="D",
+                origin="1899-12-30",
+                errors="coerce",
+            )
+
+        return dt.dt.date
+
+
 # ============================================================
 # 7- Calendario de partidos
 # ============================================================ 
@@ -756,6 +844,7 @@ class ETLChivas:
 
     def _a_numerico(self, df, columnas=None):
         import pandas as pd, re
+
         def _to_num(x):
             if x.dtype == "object":
                 x = (x.astype(str)
@@ -763,15 +852,20 @@ class ETLChivas:
                     .str.replace(r"[^\d\.\-]", "", regex=True))
             return pd.to_numeric(x, errors="coerce")
 
+        # ⛔ Nunca tocar columnas de texto/fecha
+        PROTEGER = {"Fecha", "Nombre", "Rival", "Local_Visitante", "Sessions"}
+
         if columnas is None:
-            for c in df.columns:
-                try: df[c] = _to_num(df[c])
-                except Exception: pass
-        else:
-            for c in columnas:
-                if c in df.columns:
+            columnas = [c for c in df.columns if c not in PROTEGER]
+
+        for c in columnas:
+            if c in df.columns and c not in PROTEGER:
+                try:
                     df[c] = _to_num(df[c])
+                except Exception:
+                    pass
         return df
+
 
 # ============================================================
 # 9- Identidad de jugadores (IDs, aliases y validaciones)
@@ -1095,7 +1189,7 @@ class ETLChivas:
     
     def transformar_archivo(self, ruta: Path) -> pd.DataFrame:  # Añade 'self' como primer parámetro
         """Convierte formatos problemáticos antes del ETL"""
-        df = pd.read_excel(ruta)
+        df = self._leer_excel_robusto(ruta)
         
         # Convertir timestamps UTC a fecha simple
         if 'Days' in df.columns:
@@ -1279,7 +1373,7 @@ class ETLChivas:
         if "Fecha" not in df.columns:
             raise ValueError("No se encuentra la columna 'Fecha' en el Excel.")
         df["Fecha"] = self.normalizar_fechas(df["Fecha"])
-        df = self._a_numerico(df)
+        df = self._a_numerico(df, columnas=COLUMNAS_NUMERICAS)
         df = self._calcular_ce_cs_cr(df)
 
         if self._fechas_partidos:
@@ -1562,114 +1656,94 @@ class ETLChivas:
 # ============================================================
 
     def procesar_excel(self, ruta_xlsx: Path) -> dict:
-        """
-        Procesa un archivo Excel del preparador físico, carga los entrenamientos en la base de datos
-        y recalcula las métricas semanales. Versión mejorada con:
-        - Mejor manejo de fechas
-        - Registro detallado de errores
-        - Conservación de datos originales para diagnóstico
-        
-        Args:
-            ruta_xlsx: Ruta al archivo Excel a procesar
-            
-        Returns:
-            dict: Conteo de registros procesados {
-                'entrenamientos': int, 
-                'partidos': int, 
-                'filas_rendimiento_semanal': int
-            }
-        """
         resultado = {'entrenamientos': 0, 'partidos': 0, 'filas_rendimiento_semanal': 0}
-        
         try:
             print(f"\n[INFO] Procesando archivo: {ruta_xlsx.name}")
 
-            # Usar transformación previa
+            # ✅ 1) USAR la versión transformada (NO volver a leer el Excel)
             df = self.transformar_archivo(ruta_xlsx)
-            
-            # 1. Cargar archivo conservando datos originales
-            df = pd.read_excel(ruta_xlsx)
             print(f"[DEBUG] Filas leídas: {len(df)}")
-            print("[DEBUG] Columnas originales:", df.columns.tolist())
-            
-            # Guardar copia de columna de fecha original para diagnóstico
-            col_fecha_original = next((c for c in df.columns 
-                                    if str(c).lower() in ['days', 'date', 'fecha', 'día']), None)
+            print("[DEBUG] Columnas originales (post-transformar):", df.columns.tolist())
+
+            # Guardar una copia cruda de la columna de fecha ANTES de renombrar
+            col_fecha_original = next(
+                (c for c in df.columns if str(c).lower() in ['days', 'date', 'fecha', 'día', 'dia']),
+                None
+            )
             if col_fecha_original:
                 df['_fecha_original_'] = df[col_fecha_original]
-            
-            # 2. Renombrar columnas
+
+            # 2) Renombrar columnas
             df = self._renombrar_columnas(df)
             print("[DEBUG] Columnas después de renombrar:", df.columns.tolist())
-            
-            # 3. Validar estructura básica
+
+            # 3) Validar estructura básica
             columnas_requeridas = {'Fecha', 'Nombre', 'Distancia_total'}
             faltantes = columnas_requeridas - set(df.columns)
             if faltantes:
                 raise ValueError(f"Faltan columnas requeridas: {faltantes}")
-            
-            # 4. Normalización de fechas con registro detallado
-            df["Fecha"] = self.normalizar_fechas(df["Fecha"])
-            
-            # Reporte de fechas problemáticas
+
+            # 4. Normalización de fechas (robusta para WIMU/UTC/Excel)
+            if "Fecha" not in df.columns:
+                raise ValueError("Falta columna 'Fecha' (mapeada desde 'Days' / 'Date' / 'Fecha').")
+
+            # guardo original para diagnóstico
+            df["_fecha_original_"] = df["Fecha"]
+
+            # convierto a date con parser robusto
+            df["Fecha"] = self._parsear_fecha_wimu(df["Fecha"])
+
+            # reporte de nulos
             if df["Fecha"].isnull().any():
-                n_fechas_nulas = df["Fecha"].isnull().sum()
+                n_fechas_nulas = int(df["Fecha"].isnull().sum())
                 print(f"[WARN] {n_fechas_nulas} registros con fechas no reconocidas")
-                
-                if '_fecha_original_' in df.columns:
-                    ejemplos = df[df["Fecha"].isnull()]['_fecha_original_'].dropna().unique()[:5]
+                ejemplos = (
+                    df.loc[df["Fecha"].isnull(), "_fecha_original_"]
+                    .dropna().astype(str).unique().tolist()[:5]
+                )
+                if ejemplos:
                     print("Ejemplos de valores no parseados:", ejemplos)
-            
-            # 5. Asignación de IDs de jugadores
+
+
+            # 5) Asignación de IDs
             print("\n[DEBUG] Proceso de asignación de IDs:")
             df = self._asegurar_id_jugador(df)
-            
-            # 6. Separar entrenamientos y partidos
+
+            # 6) Separar entrenos/partidos
             entrenos, partidos = self.dividir_por_calendario(df)
             print(f"[DEBUG] Entrenamientos detectados: {len(entrenos)}")
             print(f"[DEBUG] Partidos detectados: {len(partidos)}")
-            
-            # 7. Procesar entrenamientos
+
+            # 7) Procesar entrenamientos
             if not entrenos.empty:
-                # Calcular métricas
                 entrenos = self._calcular_ce_cs_cr(entrenos)
                 entrenos = self._calcular_rendimiento_total(entrenos, "Rendimiento_Diario")
-                
-                # Log de muestra
                 print("[DEBUG] Muestra de entrenamientos pre-upsert:")
                 print(entrenos[['Nombre', 'id_jugador', 'Fecha', 'Carga_Explosiva', 'Carga_Sostenida']].head(3))
-                
-                # UPSERT a la base de datos
+
                 n_entrenos = self.upsert_entrenamientos(entrenos)
                 resultado['entrenamientos'] = n_entrenos
-            
-            # 8. Procesar partidos (Opción A: solo log)
+            else:
+                print("[DEBUG] No hay entrenamientos en este archivo.")
+
+            # 8) Procesar partidos (si estás en Opción A: solo log)
             if not partidos.empty:
-                print(f"[INFO] Se detectaron {len(partidos)} filas como partidos (serán ignoradas en Opción A)")
-            
-            # 9. Recalcular rendimiento semanal
-            if not entrenos.empty:
+                print(f"[INFO] Se detectaron {len(partidos)} filas como partidos (serán ignoradas en esta opción)")
+            else:
+                print("[DEBUG] No hay partidos en este archivo.")
+
+            # 9) Recalcular semanal solo si hubo entrenos nuevos
+            if resultado['entrenamientos'] > 0:
                 ids_jugadores = entrenos['id_jugador'].dropna().unique().tolist()
                 n_semanal = self.recalcular_rendimiento_semanal(ids_jugadores)
                 resultado['filas_rendimiento_semanal'] = n_semanal
                 print(f"[DEBUG] Recalculado rendimiento semanal para {len(ids_jugadores)} jugadores")
-            
-            # 10. Guardar registros problemáticos para análisis
-            if '_fecha_original_' in df.columns and df["Fecha"].isnull().any():
-                problematicos = df[df["Fecha"].isnull()].copy()
-                ruta_problem = ruta_xlsx.parent / f"problemas_{ruta_xlsx.stem}.csv"
-                problematicos.to_csv(ruta_problem, index=False)
-                print(f"[INFO] Registros problemáticos guardados en {ruta_problem}")
-            
-            print(f"[SUCCESS] Archivo {ruta_xlsx.name} procesado: {resultado}")
+            else:
+                print("[DEBUG] Salto recálculo semanal (no hubo nuevos entrenos).")
 
-            # Elegimos una fecha de referencia para el nombre del archivo
-            # Si detectamos entrenos, usamos la fecha máxima procesada; si no, queda None y se usa mtime.
+            # 10) Archivar si hubo algo de trabajo útil
             try:
                 fecha_ref = None
-                # si se separaron entrenos/partidos en este flujo, tomamos la última fecha de entrenos cargados
-                # (en este método ya hiciste upsert de entrenos y quizá recálculo semanal)
-                # Recuperamos una mejor pista desde df si existe columna Fecha
                 if "Fecha" in df.columns and not df["Fecha"].isna().all():
                     fmax = pd.to_datetime(df["Fecha"], errors="coerce").dropna()
                     if not fmax.empty:
@@ -1677,10 +1751,10 @@ class ETLChivas:
             except Exception:
                 fecha_ref = None
 
-            # Archivar sólo si hubo algo de entrenamientos o semanal (para no archivar si falló todo)
-            if (resultado.get('entrenamientos', 0) > 0) or (resultado.get('filas_rendimiento_semanal', 0) > 0):
+            if resultado.get('entrenamientos', 0) > 0 or resultado.get('filas_rendimiento_semanal', 0) > 0:
                 self._archivar_archivo(ruta_xlsx, "entrenamientos", fecha_ref)
 
+            print(f"[SUCCESS] Archivo {ruta_xlsx.name} procesado: {resultado}")
             return resultado
 
         except PermissionError as e:
@@ -1689,23 +1763,25 @@ class ETLChivas:
             print(f"[ERROR] Error de validación: {e}")
         except Exception as e:
             print(f"[ERROR] Error inesperado: {str(e)}")
-            traceback.print_exc()        
+            traceback.print_exc()
         return resultado
 
     def procesar_carpeta(self, carpeta_raw: Path) -> dict:
-        """Procesa todos los .xlsx válidos de una carpeta en una sola pasada."""
         carpeta_raw = Path(carpeta_raw)
         totales = {"entrenamientos": 0, "partidos": 0, "filas_rendimiento_semanal": 0}
 
-        for archivo in sorted(carpeta_raw.glob("*.xlsx")):
-            # Ignorar lock files de Excel (empiezan con ~$)
+        # ⬇️ Barrer .xlsx y .xls
+        archivos = []
+        for patron in ("*.xlsx", "*.xls"):
+            archivos.extend(sorted(carpeta_raw.glob(patron)))
+
+        for archivo in archivos:
             if archivo.name.startswith("~$"):
                 print(f"[INFO] Ignorado lock file: {archivo.name}")
                 continue
             try:
                 res = self.procesar_excel(archivo)
-                for k, v in res.items():
-                    totales[k] += v
+                for k, v in res.items(): totales[k] += v
             except PermissionError as e:
                 print(f"[WARN] No se pudo abrir {archivo.name} (bloqueado). Detalle: {e}")
             except Exception as e:
@@ -1723,7 +1799,7 @@ class ETLChivas:
         try:
             # 1. Cargar archivo
             engine = "openpyxl" if ruta_excel.suffix.lower() == ".xlsx" else None
-            df = pd.read_excel(ruta_excel, engine=engine)
+            df = self._leer_excel_robusto(ruta_excel)
             
             print(f"[DEBUG] Archivo maestro cargado: {len(df)} filas")
             
@@ -1919,7 +1995,13 @@ class ETLChivas:
     def procesar_carpeta_partidos(self, dir_partidos: Path) -> int:
         dir_partidos = Path(dir_partidos)
         n_total = 0
-        for archivo in sorted(dir_partidos.glob("*.xlsx")):
+
+        # ⬇️ Barrer .xlsx y .xls
+        archivos = []
+        for patron in ("*.xlsx", "*.xls"):
+            archivos.extend(sorted(dir_partidos.glob(patron)))
+
+        for archivo in archivos:
             if archivo.name.startswith("~$"):
                 continue
             try:
@@ -1927,6 +2009,7 @@ class ETLChivas:
             except Exception as e:
                 print(f"[ERROR] Falló {archivo.name}: {e}")
         return n_total
+
 
 # ============================================================
 # 18- Helpers específicos para partidos (validación/normalización “extra”)
@@ -2060,7 +2143,52 @@ class ETLChivas:
         return self.upsert_partidos(df[columnas_requeridas])
 
 # ============================================================
-# 19- Carga de referencia de jugadores
+# 20- Helper para leer excel 97-2003
+# ============================================================
+
+    def _detectar_formato_excel(self, ruta: Path) -> str:
+        """
+        Devuelve 'xls' si es CFBF (Excel 97-2003), 'xlsx' si es ZIP (Office OpenXML),
+        o '' si no se puede detectar.
+        """
+        ruta = Path(ruta)
+        with open(ruta, "rb") as f:
+            magic = f.read(8)
+        # CFBF (xls): D0 CF 11 E0 A1 B1 1A E1
+        if magic.startswith(b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1"):
+            return "xls"
+        # ZIP (xlsx/xlsm): PK..
+        if magic.startswith(b"PK"):
+            return "xlsx"
+        return ""
+
+    def _leer_excel_robusto(self, ruta: Path) -> pd.DataFrame:
+        """
+        Lee .xlsx/.xlsm con openpyxl y .xls con xlrd==1.2.0.
+        Si la extensión no coincide con la firma, intenta el engine correcto igual.
+        """
+        ruta = Path(ruta)
+        firma = self._detectar_formato_excel(ruta)
+        suf = ruta.suffix.lower()
+
+        # Prioridad por firma (más confiable que la extensión)
+        if firma == "xlsx":
+            return pd.read_excel(ruta, engine="openpyxl")
+        if firma == "xls":
+            # Requiere xlrd==1.2.0
+            return pd.read_excel(ruta, engine="xlrd")
+
+        # Fallback por extensión si no pudimos detectar
+        if suf in (".xlsx", ".xlsm"):
+            return pd.read_excel(ruta, engine="openpyxl")
+        if suf == ".xls":
+            return pd.read_excel(ruta, engine="xlrd")
+
+        # Último intento sin engine (por si pandas lo resuelve solo)
+        return pd.read_excel(ruta)
+
+# ============================================================
+# 21- Carga de referencia de jugadores
 # ============================================================ 
 
     def cargar_db_jugadores(self, ruta_excel: Path) -> int:
@@ -2135,4 +2263,8 @@ class ETLChivas:
             print(f"[ERROR] Fallo al cargar jugadores: {str(e)}")
             traceback.print_exc()
             return 0
+
+# en pipeline.py (o helpers.py)
+
+
 

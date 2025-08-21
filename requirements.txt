@@ -1,0 +1,27 @@
+# requirements.txt
+
+# --- Data wrangling y ETL ---
+pandas>=2.0
+numpy>=1.26
+openpyxl>=3.1       # Para leer/escribir Excel modernos (.xlsx)
+xlrd>=2.0.1      # <- necesario para .xls (97–2003)
+
+
+# --- Bases de datos ---
+SQLAlchemy>=2.0     # ORM y conexión a SQLite (ya soportada nativamente)
+
+# --- Machine Learning ---
+scikit-learn>=1.4
+scipy>=1.12
+joblib>=1.3
+
+# --- Visualización / Dashboards ---
+matplotlib>=3.9
+seaborn>=0.13
+plotly>=5.22
+
+# --- Otros útiles ---
+python-dotenv>=1.0      # Para manejar .env con credenciales
+tqdm>=4.66              # Barras de progreso
+pyyaml>=6.0             # Configuración en YAML
+
