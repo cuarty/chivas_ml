@@ -10,36 +10,152 @@
 
  Índice de secciones
  ----------------------------------------------------------
- 1. Utilidades base
-    - _conectar: abre conexión a la DB
-    - _asegurar_indices: crea índices únicos y foráneos
 
- 2. Normalización de datos
-    - _normalizar_fecha: limpia fechas con formato mixto
-    - MAPEO_COLUMNAS_POR_DEFECTO: renombra columnas
-    - COLUMNAS_NUMERICAS: asegura que sean numéricas
+0) Constantes y tipos
 
- 3. Calendario de partidos
-    - _cargar_calendario_partidos: lee Excel con fechas + rivales
-    - dividir_por_calendario: separa entrenamientos y partidos
-      según calendario cargado
+    MAPEO_COLUMNAS_POR_DEFECTO
 
- 4. Cálculos de métricas
-    - _calcular_ce_cs_cr: calcula CE, CS, CR
-    - _calcular_rendimiento_total: calcula rendimiento ponderado
-      por posición del jugador
+    COLUMNAS_NUMERICAS
 
- 5. Procesamiento de datos
-    - upsert_entrenamientos: inserta/actualiza entrenos en DB
-    - upsert_partidos: inserta/actualiza partidos en DB
-    - recalcular_rendimiento_semanal: resume cargas semanales
+    ETLChivas._PESOS_POR_POSICION
 
- 6. Flujo principal
-    - procesar_excel: procesa un Excel completo y actualiza DB
-    - cargar_jugadores: carga info de jugadores en DB_Jugadores
+    ETLChivas.STOP_RIVAL
+
+1) Inicialización de la clase
+
+    __post_init__(self)
+
+2) Clase principal del ETL
+
+    _ class ETLChivas
+
+3) Conexión y administración de la DB (infra)
+
+    _conectar(self) -> sqlite3.Connection
+
+    _asegurar_indices(self)
+
+4) Rutas y archivado post-proceso
+
+    _dir_processed(self) -> Path
+
+    _archivar_archivo(self, src: Path, tipo: str, fecha_ref=None)
+
+5) Catálogo de rivales (aliases, normalización y consolidación)
+
+    _get_aliases_rivales_map(self)
+
+    consolidar_rivales(self)
+
+    estandarizar_rival_display_mayusculas(self)
+
+    _obtener_o_crear_id_rival(self, nombre_rival)
+
+    _adjuntar_id_rival(self, df_partidos)
+
+6) Normalización de texto y parsers utilitarios
+
+    _norm_texto(self, s, drop_tokens=None)
+
+    _norm_txt_simple(self, s)
+
+    _normalizar_txt(self, s: str) -> str (similar a las dos anteriores — podés unificarlas)
+
+    _derivar_rival_y_local(self, serie_sessions: pd.Series) -> pd.DataFrame
+
+    _inferir_fecha(self, rival, lv) (usa calendario; opcional si ya resolvés por join)
+
+    _es_chivas(self, nombre_equipo: str) -> bool
+
+    _obtener_fecha_por_rival(self, rival: str) (si mantenés este helper)
+
+7) Calendario de partidos
+
+    cargar_calendario_partidos(self, ruta_xlsx: Path, sheet_name=None)
+
+    Campo interno: self._calendario_partidos_df
+
+    Set interno: self._fechas_partidos
+
+8) Normalización de columnas y casting numérico
+
+    _renombrar_columnas(self, df: pd.DataFrame) -> pd.DataFrame
+
+    _a_numerico(self, df, columnas=None)
+
+9) Identidad de jugadores (IDs, aliases y validaciones)
+
+    _anexar_id_jugador_por_nombre(self, df)
+
+    _aplicar_alias_jugadores(self, df)
+
+    _fabricar_alias_desde_db(self) -> dict[str,int]
+
+    _resolver_id_por_alias_heuristico(self, serie_nombres: pd.Series)
+
+    _buscar_jugadores_similares(self, nombre: str, umbral=0.7)
+
+    validar_aliases(self)
+
+    _asegurar_id_jugador(self, df)
+
+10) Fechas
+
+    normalizar_fechas(serie: pd.Series) -> pd.Series (@staticmethod)
+
+    transformar_archivo(self, ruta: Path) -> pd.DataFrame (pre-ETL, corrige “Days”/UTC)
+
+11) Cálculo de métricas (CE/CS/CR y Rendimiento)
+
+    _serie_segura(self, df, col, dtype=float)
+
+    _calcular_ce_cs_cr(self, df)
+
+    _posicion_por_jugador(self, ids: list[int]) -> dict[int,str]
+
+    _percentiles_por_jugador(self, id_jugador: int) -> dict
+
+    _escala_0a100(x, p10, p90) -> pd.Series (@staticmethod)
+
+    _calcular_rendimiento_total(self, df, destino_col: str)
+
+12) Clasificación “Entrenamiento vs Partido”
+
+    dividir_por_calendario(self, df) -> (entrenos, partidos)
+
+    corregir_local_visitante(self, df_partidos, df_cal)
+
+13) UPSERTs a la base
+
+    upsert_entrenamientos(self, df)
+
+    upsert_partidos(self, df)
+
+14) Agregaciones / Reporting en DB
+
+    _inicio_semana(serie_fechas) -> pd.Series (@staticmethod)
+
+    recalcular_rendimiento_semanal(self, jugadores: Optional[Iterable[int]] = None)
+
+15) Procesamiento de entrenamientos (archivo y carpeta)
+
+    procesar_excel(self, ruta_xlsx: Path) -> dict (entrenos + recalcular semanal + archivar “entrenamientos”)
+
+    procesar_carpeta(self, carpeta_raw: Path) -> dict (itera entrenos)
+
+16) Procesamiento de partidos (archivo y carpeta)
+
+    cargar_partidos_desde_master(self, ruta_excel: Path) -> int (cruza con calendario + upsert + archiva “partidos”)
+
+    procesar_carpeta_partidos(self, dir_partidos: Path) -> int
+
+18) Carga de referencia de jugadores
+
+    cargar_db_jugadores(self, ruta_excel: Path) -> int
 
  Notas:
-    - Los Excel originales se dejan en /data/raw
+    - Los Excel originales de entrenamiento se dejan en /data/raw/entrenamientos
+    - Los Excel originales de entrenamiento se dejan en /data/raw/partidos
     - La DB SQLite se guarda en /data/chivas_dw.sqlite
     - El proceso es incremental: cada semana se pueden cargar
       nuevos Excel sin duplicar datos
@@ -65,7 +181,7 @@ import shutil
 
 
 # ============================================================
-# Configuración y mapeos de columnas
+# 0- CONSTANTES Y TIPOS
 # ============================================================
 
 MAPEO_COLUMNAS_POR_DEFECTO: Dict[str, str] = {
@@ -146,29 +262,7 @@ COLUMNAS_NUMERICAS = [
     "Minutos_jugados", "id_rival",
 ]
 
-# ============================================================
-# Clase principal del ETL
-# ============================================================
-
-@dataclass
-class ETLChivas:
-    ruta_sqlite: Path
-    calendario_partidos_xlsx: Optional[Path] = None
-    mapeo_columnas: Optional[Dict[str, str]] = None
-
-    def __post_init__(self):
-        self.ruta_sqlite = Path(self.ruta_sqlite)
-        self.mapeo_columnas = {**MAPEO_COLUMNAS_POR_DEFECTO, **(self.mapeo_columnas or {})}
-        self._fechas_partidos = set()
-        if self.calendario_partidos_xlsx:
-            self.cargar_calendario_partidos(self.calendario_partidos_xlsx)
-        self._asegurar_indices()
-
-
-    # ------------------ Rendimiento Total (0–100) ------------------
-
-    # Ponderaciones por posición (ajustables):
-    _PESOS_POR_POSICION = {
+_PESOS_POR_POSICION = {
         #        CE,   CS,   CR
         "Arquero":   (0.45, 0.35, 0.20),
         "Defensa":   (0.40, 0.45, 0.15),
@@ -178,15 +272,34 @@ class ETLChivas:
         "_default":  (0.45, 0.40, 0.15),
     }
 
-    # -------------------------------------------------------
+STOP_RIVAL = {"fc", "cf", "club", "deportivo", "cd", "c"}  # c. juarez -> juarez
 
 
-    
+# ============================================================
+# 1- Clase principal del ETL
+# ============================================================
 
+@dataclass
+class ETLChivas:
+    ruta_sqlite: Path
+    calendario_partidos_xlsx: Optional[Path] = None
+    mapeo_columnas: Optional[Dict[str, str]] = None
 
-    # --------------------------------------------------------
-    # Utilidades base
-    # --------------------------------------------------------
+# ============================================================
+# 2- INICIALIZACIÓN DE CLASE
+# ============================================================    
+
+    def __post_init__(self):
+        self.ruta_sqlite = Path(self.ruta_sqlite)
+        self.mapeo_columnas = {**MAPEO_COLUMNAS_POR_DEFECTO, **(self.mapeo_columnas or {})}
+        self._fechas_partidos = set()
+        if self.calendario_partidos_xlsx:
+            self.cargar_calendario_partidos(self.calendario_partidos_xlsx)
+        self._asegurar_indices()
+
+# ============================================================
+# 3- Conexión y administración de la DB (infra)
+# ============================================================  
 
     def _conectar(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.ruta_sqlite)
@@ -209,6 +322,9 @@ class ETLChivas:
                 ON Rendimiento_Semanal(id_jugador, Fecha);
             """)
 
+# ============================================================
+# 4- Rutas y archivado post-proceso
+# ============================================================  
 
     def _dir_processed(self) -> Path:
         # data/external/chivas_dw.sqlite -> BASE=data ; processed=BASE/processed
@@ -247,6 +363,9 @@ class ETLChivas:
         shutil.move(str(src), str(destino))
         print(f"[ARCHIVO] Movido a {destino.relative_to(self.ruta_sqlite.parent.parent)}")
 
+# ============================================================
+# 5- Catálogo de rivales (aliases, normalización y consolidación)
+# ============================================================  
 
     def _get_aliases_rivales_map(self):
         import pandas as pd
@@ -350,36 +469,365 @@ class ETLChivas:
         con.commit()
         con.close()
 
+    def estandarizar_rival_display_mayusculas(self):
+        import sqlite3
+        con = sqlite3.connect(self.ruta_sqlite)
+        con.execute("PRAGMA foreign_keys=ON")
+        # si no hay id_rival, dejamos Rival en NULL
+        con.execute("""
+            UPDATE DB_Partidos AS p
+            SET Rival = UPPER( (SELECT r.Nombre FROM DB_Rivales r WHERE r.id_rival = p.id_rival) )
+            WHERE p.id_rival IS NOT NULL
+        """)
+        # limpiar rivales huérfanos (sin id_rival), opcional:
+        con.execute("UPDATE DB_Partidos SET Rival = NULL WHERE id_rival IS NULL")
+        con.commit()
+        con.close()
 
-    
-    def transformar_archivo(self, ruta: Path) -> pd.DataFrame:  # Añade 'self' como primer parámetro
-        """Convierte formatos problemáticos antes del ETL"""
-        df = pd.read_excel(ruta)
+    def _obtener_o_crear_id_rival(self, nombre_rival):
+        import sqlite3
+        norm = self._norm_texto(nombre_rival, drop_tokens=self.STOP_RIVAL)
+        if not norm:
+            return None
+
+        con = sqlite3.connect(self.ruta_sqlite)
+        con.execute("PRAGMA foreign_keys=ON")
+
+        # asegurar columna antes de consultar
+        cols = {row[1] for row in con.execute("PRAGMA table_info(DB_Rivales)")}
+        if "Nombre_norm" not in cols:
+            con.execute("ALTER TABLE DB_Rivales ADD COLUMN Nombre_norm TEXT")
+
+        cur = con.cursor()
+        # 1) buscar por clave canónica
+        cur.execute("SELECT id_rival FROM DB_Rivales WHERE Nombre_norm=?", (norm,))
+        row = cur.fetchone()
+        if row:
+            con.close()
+            return row[0]
+
+        # 2) insertar una sola vez con Nombre “lindo” y Nombre_norm
+        pretty = (str(nombre_rival).strip() or norm.title())
+        cur.execute("INSERT INTO DB_Rivales (Nombre, Nombre_norm) VALUES (?,?)", (pretty, norm))
+        rid = cur.lastrowid
+        con.commit()
+        con.close()
+        return rid
+
+    def _adjuntar_id_rival(self, df_partidos):
+        if df_partidos.empty:
+            return df_partidos
+        if "Rival" not in df_partidos.columns:
+            df_partidos["Rival"] = None
+        if "id_rival" not in df_partidos.columns:
+            df_partidos["id_rival"] = None
+
+        nombres = (
+            df_partidos["Rival"].dropna().astype(str).str.strip().replace({"": np.nan}).dropna().unique().tolist()
+        )
+        cache = {nom: self._obtener_o_crear_id_rival(nom) for nom in nombres}
+
+        def completar_id(row):
+            if pd.notna(row.get("id_rival")):
+                return row["id_rival"]
+            nom = row.get("Rival")
+            if pd.isna(nom):
+                return None
+            return cache.get(str(nom).strip())
+
+        df_partidos["id_rival"] = df_partidos.apply(completar_id, axis=1)
+        return df_partidos
+
+# ============================================================
+# 6- Normalización de texto y parsers utilitarios
+# ============================================================ 
+
+    def _norm_txt_simple(self, s):
+        if s is None: return None
+        s = str(s).lower().strip()
+        s = "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
+        s = re.sub(r"[^\w\s]", " ", s)
+        s = re.sub(r"\s+", " ", s).strip()
+        return s or None
+
+    def _norm_texto(self, s, drop_tokens=None):
+        import re, unicodedata
+        if s is None:
+            return None
+        s = str(s).casefold().strip()
+        s = unicodedata.normalize("NFKD", s)
+        s = "".join(c for c in s if not unicodedata.combining(c))
+        s = re.sub(r"[^\w\s]", " ", s)      # quita puntos/guiones/etc
+        s = re.sub(r"\s+", " ", s).strip()
+        if not s:
+            return None
+
+        tokens = s.split()
+        if drop_tokens:
+            tokens = [t for t in tokens if t not in drop_tokens]
+
+        # compactar secuencias de letras sueltas: "u d g" -> "udg"
+        out = []
+        i = 0
+        while i < len(tokens):
+            if len(tokens[i]) == 1:
+                j = i
+                pack = []
+                while j < len(tokens) and len(tokens[j]) == 1:
+                    pack.append(tokens[j]); j += 1
+                out.append("".join(pack))
+                i = j
+            else:
+                out.append(tokens[i])
+                i += 1
+
+        s = " ".join(t for t in out if t)
+        return s or None
+
+    def _normalizar_txt(self, s: str) -> str:
+        if s is None:
+            return ""
+        s = str(s).strip().lower()
+        # remover acentos
+        s = "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn")
+        # limpiar espacios múltiples
+        s = re.sub(r"\s+", " ", s)
+        return s
+
+    def _derivar_rival_y_local(self, serie_sessions: pd.Series) -> pd.DataFrame:
+        rivales, local_visit = [], []
+        def norm(s): return str(s).strip()
+
+        pats = [
+            (r"^\s*(.+?)\s+v(?:s\.?)?\s+guadalajara\s*$", "Visitante", 1),  # Rival vs Guadalajara -> Visitante
+            (r"^\s*guadalajara\s+v(?:s\.?)?\s+(.+?)\s*$", "Local", 1),      # Guadalajara vs Rival -> Local
+        ]
+
+        for txt in serie_sessions.fillna(""):
+            s = norm(txt)
+            rival, lv = None, None
+            for pat, lv_val, g in pats:
+                m = re.match(pat, s, flags=re.I)
+                if m:
+                    rival = norm(m.group(g))
+                    lv = lv_val
+                    break
+            if rival is None:
+                # fallback: quitar “guadalajara” y quedarme con lo otro
+                s_clean = re.sub(r"guadalajara", "", s, flags=re.I).strip()
+                # si aún queda un “vs...” separar por vs/contra
+                parts = re.split(r"\b(?:v(?:s\.?)?|contra)\b", s_clean, flags=re.I)
+                rival = parts[-1].strip() if parts else None
+                lv = None
+            rivales.append(rival if rival else None)
+            local_visit.append(lv)
+        return pd.DataFrame({"Rival_from_sess": rivales, "Local_Visitante_from_sess": local_visit})
+
+    def _inferir_fecha(self, rival, lv):
+        if not hasattr(self, "_calendario_partidos_df"): 
+            return None
+        cal = self._calendario_partidos_df.copy()
+        cal["Rival_norm"] = cal["Rival"].apply(self._norm_txt_simple)
+        cal["LV_norm"]    = cal.get("Local_Visitante", pd.Series([None]*len(cal))).apply(self._norm_txt_simple)
+
+        r = self._norm_txt_simple(rival)
+        l = self._norm_txt_simple(lv)
+        if r is None: 
+            return None
+
+        # 1) Rival + LV
+        m = cal[(cal["Rival_norm"] == r) & (cal["LV_norm"] == l)]
+        if len(m) == 1: 
+            return m.iloc[0]["Fecha"]
+
+        # 2) Sólo Rival
+        m = cal[cal["Rival_norm"] == r]
+        if len(m) == 1:
+            return m.iloc[0]["Fecha"]
+
+        return None
+
+    def _es_chivas(self, nombre_equipo: str) -> bool:
+        """Detecta si 'nombre_equipo' hace referencia a Chivas (varios alias)."""
+        alias_chivas = {
+            "guadalajara",
+            "chivas",
+            "chivas de guadalajara",
+            "club deportivo guadalajara",
+            "cd guadalajara",
+            "c.d. guadalajara",
+            "guadalajara chivas",
+            "chivas guadalajara",
+        }
+        return self._normalizar_txt(nombre_equipo) in alias_chivas
+
+    def _obtener_fecha_por_rival(self, rival: str) -> Optional[date]:
+        """Obtiene la fecha del partido basado en el rival desde el calendario"""
+        if not hasattr(self, '_calendario_partidos_df') or rival is None:
+            return None
         
-        # Convertir timestamps UTC a fecha simple
-        if 'Days' in df.columns:
-            try:
-                # Primero intentar parsear como timestamp UTC
-                df['Days'] = pd.to_datetime(
-                    df['Days'], 
-                    format='%a %b %d %H:%M:%S UTC %Y',
-                    errors='coerce'
-                )
-                
-                # Si falla, intentar otros formatos
-                if df['Days'].isna().any():
-                    df['Days'] = pd.to_datetime(
-                        df['Days'], 
-                        infer_datetime_format=True,
-                        errors='coerce'
-                    )
-                
-                # Convertir a date
-                df['Days'] = df['Days'].dt.date
-            except Exception as e:
-                print(f"[WARN] Error transformando fechas: {str(e)}")
+        try:
+            # Buscar en el calendario
+            match = self._calendario_partidos_df[
+                self._calendario_partidos_df['Rival'].str.contains(rival, case=False, na=False)
+            ]
+            
+            if not match.empty:
+                return match.iloc[0]['Fecha']
+            
+            # Intentar con nombres normalizados
+            rival_norm = self._normalizar_nombre_rival(rival)
+            match = self._calendario_partidos_df[
+                self._calendario_partidos_df['Rival'].str.contains(rival_norm, case=False, na=False)
+            ]
+            
+            return match.iloc[0]['Fecha'] if not match.empty else None
+            
+        except Exception:
+            return None
+
+# ============================================================
+# 7- Calendario de partidos
+# ============================================================ 
+
+    def cargar_calendario_partidos(self, ruta_xlsx: Path, sheet_name: str | int | None = None):
+        """
+        Lee un Excel con columnas: Fecha (obligatoria), Rival (opcional), Local_Visitante (opcional), id_rival (opcional).
+        Acepta sheet_name como nombre/índice; si es None y hay varias hojas, toma la primera no vacía.
+        """
+        raw = pd.read_excel(ruta_xlsx, sheet_name=sheet_name)
+
+        # Si viene un dict (varias hojas), elegimos la primera con columnas
+        if isinstance(raw, dict):
+            # priorizar la primera con alguna columna que parezca fecha
+            candidatos = []
+            for name, df0 in raw.items():
+                if isinstance(df0, pd.DataFrame) and len(df0.columns) > 0 and len(df0) > 0:
+                    candidatos.append((name, df0))
+            if not candidatos:
+                raise ValueError("El archivo del calendario no tiene hojas con datos.")
+            df_cal = candidatos[0][1].copy()
+        else:
+            df_cal = raw.copy()
+
+        # Identificar la columna de fecha
+        cols_lower = {c: str(c).strip().lower() for c in df_cal.columns}
+        candidatas = [c for c, s in cols_lower.items() if "fecha" in s or s in ("date",)]
+        if not candidatas:
+            raise ValueError("El calendario de partidos debe incluir una columna de fecha.")
+
+        # Normalizar fecha -> 'Fecha'
+        df_cal = df_cal.rename(columns={candidatas[0]: "Fecha"})
+        df_cal["Fecha"] = self.normalizar_fechas(df_cal["Fecha"])
+
+        # Normalizar nombres posibles
+        ren = {"Local / Visitante": "Local_Visitante", "Local-Visitante": "Local_Visitante"}
+        df_cal = df_cal.rename(columns=ren)
+
+        # Guardar para merge + set de fechas
+        keep = ["Fecha"] + [c for c in ["Rival", "Local_Visitante", "id_rival"] if c in df_cal.columns]
+        self._calendario_partidos_df = df_cal[keep].copy()
+        self._fechas_partidos = set(self._calendario_partidos_df["Fecha"].dropna().tolist())
+
+# ============================================================
+# 8- Normalización de columnas y casting numérico
+# ============================================================ 
+
+    def _renombrar_columnas(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Versión mejorada que maneja espacios y mayúsculas"""
+        nuevos_nombres = {}
+        for col_original in df.columns:
+            # Normalizar el nombre para comparación
+            col_normalizada = (
+                str(col_original).strip().lower().replace(" ", "_").replace("-", "_"))
+            
+            # Buscar en el mapeo ignorando mayúsculas/espacios
+            for patron, destino in self.mapeo_columnas.items():
+                patron_normalizado = (
+                    str(patron).strip().lower().replace(" ", "_").replace("-", "_"))
+                if patron_normalizado == col_normalizada:
+                    nuevos_nombres[col_original] = destino
+                    break
+            else:
+                # Mantener el original si no hay match
+                nuevos_nombres[col_original] = col_original
         
+        return df.rename(columns=nuevos_nombres)
+
+    def _a_numerico(self, df, columnas=None):
+        import pandas as pd, re
+        def _to_num(x):
+            if x.dtype == "object":
+                x = (x.astype(str)
+                    .str.replace(",", ".", regex=False)
+                    .str.replace(r"[^\d\.\-]", "", regex=True))
+            return pd.to_numeric(x, errors="coerce")
+
+        if columnas is None:
+            for c in df.columns:
+                try: df[c] = _to_num(df[c])
+                except Exception: pass
+        else:
+            for c in columnas:
+                if c in df.columns:
+                    df[c] = _to_num(df[c])
         return df
+
+# ============================================================
+# 9- Identidad de jugadores (IDs, aliases y validaciones)
+# ============================================================ 
+         
+    def _anexar_id_jugador_por_nombre(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Completa id_jugador buscando por Nombre en DB_Jugadores (normaliza acentos/case)."""
+        if df.empty:
+            df["id_jugador"] = pd.Series([], dtype="Int64")
+            return df
+
+        if "Nombre" not in df.columns:
+            df["id_jugador"] = pd.NA
+            return df
+
+        with self._conectar() as conn:
+            ref = pd.read_sql("SELECT id_jugador, Nombre FROM DB_Jugadores", conn)
+
+        ref["Nombre_norm"] = ref["Nombre"].astype(str).map(self._norm_texto)
+        df = df.copy()
+        df["Nombre_norm"] = df["Nombre"].astype(str).map(self._norm_texto)
+
+        m = df.merge(ref[["id_jugador","Nombre_norm"]], on="Nombre_norm", how="left")
+        m = m.drop(columns=["Nombre_norm"])
+
+        # log
+        if "id_jugador" in m.columns:
+            no_map = m[m["id_jugador"].isna()]
+            if not no_map.empty:
+                ejemplos = no_map["Nombre"].dropna().astype(str).unique().tolist()[:8]
+                print(f"[WARN] No pude mapear {len(no_map)} jugador(es) por nombre. Ejemplos: {ejemplos}")
+
+        return m
+
+    def _aplicar_alias_jugadores(self, df: pd.DataFrame) -> pd.DataFrame:
+        # Cargar aliases con manejo de mayúsculas/espacios
+        alias_path = Path("data/ref/aliases_jugadores.csv")
+        aliases = pd.read_csv(alias_path)
+        
+        # Crear mapeo normalizado
+        alias_dict = {}
+        for _, row in aliases.iterrows():
+            # Todas las variantes posibles
+            nombres = [
+                str(row['Nombre_Fuente']).strip(),
+                str(row['Nombre_Fuente']).strip().upper(),
+                str(row['Nombre_Fuente']).strip().title()
+            ]
+            for nombre in nombres:
+                alias_dict[self._norm_texto(nombre)] = row['id_jugador']
+        
+        # Aplicar aliases
+        df['nombre_norm'] = df['Nombre'].apply(self._norm_texto)
+        df['id_jugador'] = df['id_jugador'].fillna(df['nombre_norm'].map(alias_dict))
+        
+        return df.drop(columns=['nombre_norm'], errors='ignore')
 
     def _fabricar_alias_desde_db(self) -> dict[str, int]:
         """
@@ -444,7 +892,6 @@ class ETLChivas:
 
         return alias2id
 
-
     def _resolver_id_por_alias_heuristico(self, serie_nombres: pd.Series) -> pd.Series:
         """
         Resuelve id_jugador usando los alias fabricados.
@@ -482,217 +929,7 @@ class ETLChivas:
 
         out = serie_nombres.astype(str).map(resolver).astype("Int64")
         return out
-
-    def _norm_txt_simple(self, s):
-        if s is None: return None
-        s = str(s).lower().strip()
-        s = "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
-        s = re.sub(r"[^\w\s]", " ", s)
-        s = re.sub(r"\s+", " ", s).strip()
-        return s or None
-
-    def _inferir_fecha(self, rival, lv):
-        if not hasattr(self, "_calendario_partidos_df"): 
-            return None
-        cal = self._calendario_partidos_df.copy()
-        cal["Rival_norm"] = cal["Rival"].apply(self._norm_txt_simple)
-        cal["LV_norm"]    = cal.get("Local_Visitante", pd.Series([None]*len(cal))).apply(self._norm_txt_simple)
-
-        r = self._norm_txt_simple(rival)
-        l = self._norm_txt_simple(lv)
-        if r is None: 
-            return None
-
-        # 1) Rival + LV
-        m = cal[(cal["Rival_norm"] == r) & (cal["LV_norm"] == l)]
-        if len(m) == 1: 
-            return m.iloc[0]["Fecha"]
-
-        # 2) Sólo Rival
-        m = cal[cal["Rival_norm"] == r]
-        if len(m) == 1:
-            return m.iloc[0]["Fecha"]
-
-        return None
-
-
-    STOP_RIVAL = {"fc", "cf", "club", "deportivo", "cd", "c"}  # c. juarez -> juarez
-
-    def _norm_texto(self, s, drop_tokens=None):
-        import re, unicodedata
-        if s is None:
-            return None
-        s = str(s).casefold().strip()
-        s = unicodedata.normalize("NFKD", s)
-        s = "".join(c for c in s if not unicodedata.combining(c))
-        s = re.sub(r"[^\w\s]", " ", s)      # quita puntos/guiones/etc
-        s = re.sub(r"\s+", " ", s).strip()
-        if not s:
-            return None
-
-        tokens = s.split()
-        if drop_tokens:
-            tokens = [t for t in tokens if t not in drop_tokens]
-
-        # compactar secuencias de letras sueltas: "u d g" -> "udg"
-        out = []
-        i = 0
-        while i < len(tokens):
-            if len(tokens[i]) == 1:
-                j = i
-                pack = []
-                while j < len(tokens) and len(tokens[j]) == 1:
-                    pack.append(tokens[j]); j += 1
-                out.append("".join(pack))
-                i = j
-            else:
-                out.append(tokens[i])
-                i += 1
-
-        s = " ".join(t for t in out if t)
-        return s or None
-
-
-    def estandarizar_rival_display_mayusculas(self):
-        import sqlite3
-        con = sqlite3.connect(self.ruta_sqlite)
-        con.execute("PRAGMA foreign_keys=ON")
-        # si no hay id_rival, dejamos Rival en NULL
-        con.execute("""
-            UPDATE DB_Partidos AS p
-            SET Rival = UPPER( (SELECT r.Nombre FROM DB_Rivales r WHERE r.id_rival = p.id_rival) )
-            WHERE p.id_rival IS NOT NULL
-        """)
-        # limpiar rivales huérfanos (sin id_rival), opcional:
-        con.execute("UPDATE DB_Partidos SET Rival = NULL WHERE id_rival IS NULL")
-        con.commit()
-        con.close()
-
-
-        
-    def _obtener_o_crear_id_rival(self, nombre_rival):
-        import sqlite3
-        norm = self._norm_texto(nombre_rival, drop_tokens=self.STOP_RIVAL)
-        if not norm:
-            return None
-
-        con = sqlite3.connect(self.ruta_sqlite)
-        con.execute("PRAGMA foreign_keys=ON")
-
-        # asegurar columna antes de consultar
-        cols = {row[1] for row in con.execute("PRAGMA table_info(DB_Rivales)")}
-        if "Nombre_norm" not in cols:
-            con.execute("ALTER TABLE DB_Rivales ADD COLUMN Nombre_norm TEXT")
-
-        cur = con.cursor()
-        # 1) buscar por clave canónica
-        cur.execute("SELECT id_rival FROM DB_Rivales WHERE Nombre_norm=?", (norm,))
-        row = cur.fetchone()
-        if row:
-            con.close()
-            return row[0]
-
-        # 2) insertar una sola vez con Nombre “lindo” y Nombre_norm
-        pretty = (str(nombre_rival).strip() or norm.title())
-        cur.execute("INSERT INTO DB_Rivales (Nombre, Nombre_norm) VALUES (?,?)", (pretty, norm))
-        rid = cur.lastrowid
-        con.commit()
-        con.close()
-        return rid
-
-
-    def procesar_carpeta_partidos(self, dir_partidos: Path) -> int:
-        dir_partidos = Path(dir_partidos)
-        n_total = 0
-        for archivo in sorted(dir_partidos.glob("*.xlsx")):
-            if archivo.name.startswith("~$"):
-                continue
-            try:
-                n_total += self.cargar_partidos_desde_master(archivo)
-            except Exception as e:
-                print(f"[ERROR] Falló {archivo.name}: {e}")
-        return n_total
-
-
-
-    def _adjuntar_id_rival(self, df_partidos):
-        if df_partidos.empty:
-            return df_partidos
-        if "Rival" not in df_partidos.columns:
-            df_partidos["Rival"] = None
-        if "id_rival" not in df_partidos.columns:
-            df_partidos["id_rival"] = None
-
-        nombres = (
-            df_partidos["Rival"].dropna().astype(str).str.strip().replace({"": np.nan}).dropna().unique().tolist()
-        )
-        cache = {nom: self._obtener_o_crear_id_rival(nom) for nom in nombres}
-
-        def completar_id(row):
-            if pd.notna(row.get("id_rival")):
-                return row["id_rival"]
-            nom = row.get("Rival")
-            if pd.isna(nom):
-                return None
-            return cache.get(str(nom).strip())
-
-        df_partidos["id_rival"] = df_partidos.apply(completar_id, axis=1)
-        return df_partidos
-    
-      
-    def _anexar_id_jugador_por_nombre(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Completa id_jugador buscando por Nombre en DB_Jugadores (normaliza acentos/case)."""
-        if df.empty:
-            df["id_jugador"] = pd.Series([], dtype="Int64")
-            return df
-
-        if "Nombre" not in df.columns:
-            df["id_jugador"] = pd.NA
-            return df
-
-        with self._conectar() as conn:
-            ref = pd.read_sql("SELECT id_jugador, Nombre FROM DB_Jugadores", conn)
-
-        ref["Nombre_norm"] = ref["Nombre"].astype(str).map(self._norm_texto)
-        df = df.copy()
-        df["Nombre_norm"] = df["Nombre"].astype(str).map(self._norm_texto)
-
-        m = df.merge(ref[["id_jugador","Nombre_norm"]], on="Nombre_norm", how="left")
-        m = m.drop(columns=["Nombre_norm"])
-
-        # log
-        if "id_jugador" in m.columns:
-            no_map = m[m["id_jugador"].isna()]
-            if not no_map.empty:
-                ejemplos = no_map["Nombre"].dropna().astype(str).unique().tolist()[:8]
-                print(f"[WARN] No pude mapear {len(no_map)} jugador(es) por nombre. Ejemplos: {ejemplos}")
-
-        return m
-
-
-    def _aplicar_alias_jugadores(self, df: pd.DataFrame) -> pd.DataFrame:
-        # Cargar aliases con manejo de mayúsculas/espacios
-        alias_path = Path("data/ref/aliases_jugadores.csv")
-        aliases = pd.read_csv(alias_path)
-        
-        # Crear mapeo normalizado
-        alias_dict = {}
-        for _, row in aliases.iterrows():
-            # Todas las variantes posibles
-            nombres = [
-                str(row['Nombre_Fuente']).strip(),
-                str(row['Nombre_Fuente']).strip().upper(),
-                str(row['Nombre_Fuente']).strip().title()
-            ]
-            for nombre in nombres:
-                alias_dict[self._norm_texto(nombre)] = row['id_jugador']
-        
-        # Aplicar aliases
-        df['nombre_norm'] = df['Nombre'].apply(self._norm_texto)
-        df['id_jugador'] = df['id_jugador'].fillna(df['nombre_norm'].map(alias_dict))
-        
-        return df.drop(columns=['nombre_norm'], errors='ignore')
-        
+       
     def _buscar_jugadores_similares(self, nombre: str, umbral=0.7) -> list[dict]:
         """
         Busca jugadores en la DB con nombres similares al proporcionado usando fuzzy matching.
@@ -718,7 +955,6 @@ class ETLChivas:
         # Ordenar por similitud descendente
         similares.sort(key=lambda x: x['similitud'], reverse=True)
         return similares
-
         
     def validar_aliases(self):
         """Verifica que todos los IDs en aliases existan en la DB"""
@@ -746,7 +982,6 @@ class ETLChivas:
                     print("  Jugadores similares en DB:")
                     for j in similares:
                         print(f"  - ID {j['id_jugador']}: {j['Nombre']}")
-
 
     def _asegurar_id_jugador(self, df: pd.DataFrame) -> pd.DataFrame:
         """Asigna IDs de jugador con robustez y logging"""
@@ -793,106 +1028,9 @@ class ETLChivas:
         
         return df.drop(columns=['nombre_norm'], errors='ignore')
 
-    def corregir_local_visitante(self, df_partidos, df_cal):
-        if df_partidos.empty or df_cal.empty or "Rival" not in df_partidos.columns:
-            return df_partidos
-        a = df_partidos.copy()
-        b = df_cal.copy()
-        a["R_norm"] = a["Rival"].apply(self._norm_txt_simple)
-        b["R_norm"] = b["Rival"].apply(self._norm_txt_simple)
-        a["LV_norm"] = a.get("Local_Visitante", pd.Series([None]*len(a))).apply(self._norm_txt_simple)
-        b["LV_norm"] = b.get("Local_Visitante", pd.Series([None]*len(b))).apply(self._norm_txt_simple)
-        a = a.merge(b[["Fecha","R_norm","LV_norm","Local_Visitante"]]
-                    .rename(columns={"Local_Visitante":"Local_Visitante_correcto"}),
-                    on=["Fecha","R_norm","LV_norm"], how="left")
-        a["Local_Visitante"] = a["Local_Visitante_correcto"].fillna(a["Local_Visitante"])
-        return a.drop(columns=["R_norm","LV_norm","Local_Visitante_correcto"], errors="ignore")
-
-
-    def _normalizar_txt(self, s: str) -> str:
-        if s is None:
-            return ""
-        s = str(s).strip().lower()
-        # remover acentos
-        s = "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn")
-        # limpiar espacios múltiples
-        s = re.sub(r"\s+", " ", s)
-        return s
-
-    def _es_chivas(self, nombre_equipo: str) -> bool:
-        """Detecta si 'nombre_equipo' hace referencia a Chivas (varios alias)."""
-        alias_chivas = {
-            "guadalajara",
-            "chivas",
-            "chivas de guadalajara",
-            "club deportivo guadalajara",
-            "cd guadalajara",
-            "c.d. guadalajara",
-            "guadalajara chivas",
-            "chivas guadalajara",
-        }
-        return self._normalizar_txt(nombre_equipo) in alias_chivas
-
-    def _derivar_rival_y_local(self, serie_sessions: pd.Series) -> pd.DataFrame:
-        rivales, local_visit = [], []
-        def norm(s): return str(s).strip()
-
-        pats = [
-            (r"^\s*(.+?)\s+v(?:s\.?)?\s+guadalajara\s*$", "Visitante", 1),  # Rival vs Guadalajara -> Visitante
-            (r"^\s*guadalajara\s+v(?:s\.?)?\s+(.+?)\s*$", "Local", 1),      # Guadalajara vs Rival -> Local
-        ]
-
-        for txt in serie_sessions.fillna(""):
-            s = norm(txt)
-            rival, lv = None, None
-            for pat, lv_val, g in pats:
-                m = re.match(pat, s, flags=re.I)
-                if m:
-                    rival = norm(m.group(g))
-                    lv = lv_val
-                    break
-            if rival is None:
-                # fallback: quitar “guadalajara” y quedarme con lo otro
-                s_clean = re.sub(r"guadalajara", "", s, flags=re.I).strip()
-                # si aún queda un “vs...” separar por vs/contra
-                parts = re.split(r"\b(?:v(?:s\.?)?|contra)\b", s_clean, flags=re.I)
-                rival = parts[-1].strip() if parts else None
-                lv = None
-            rivales.append(rival if rival else None)
-            local_visit.append(lv)
-        return pd.DataFrame({"Rival_from_sess": rivales, "Local_Visitante_from_sess": local_visit})
-
-
-    def _obtener_fecha_por_rival(self, rival: str) -> Optional[date]:
-        """Obtiene la fecha del partido basado en el rival desde el calendario"""
-        if not hasattr(self, '_calendario_partidos_df') or rival is None:
-            return None
-        
-        try:
-            # Buscar en el calendario
-            match = self._calendario_partidos_df[
-                self._calendario_partidos_df['Rival'].str.contains(rival, case=False, na=False)
-            ]
-            
-            if not match.empty:
-                return match.iloc[0]['Fecha']
-            
-            # Intentar con nombres normalizados
-            rival_norm = self._normalizar_nombre_rival(rival)
-            match = self._calendario_partidos_df[
-                self._calendario_partidos_df['Rival'].str.contains(rival_norm, case=False, na=False)
-            ]
-            
-            return match.iloc[0]['Fecha'] if not match.empty else None
-            
-        except Exception:
-            return None
-
-    # --------------------------------------------------------
-    # 1) Normalización de fechas
-    # --------------------------------------------------------
-
-    
+# ============================================================
+# 10- Fechas
+# ============================================================ 
     @staticmethod
     def normalizar_fechas(serie: pd.Series) -> pd.Series:
         """
@@ -954,104 +1092,77 @@ class ETLChivas:
         
         # 5. Si todo falla, devolver serie con NaT/None
         return pd.to_datetime(serie, errors='coerce').dt.date
-
-
-
-    # --------------------------------------------------------
-    # 2) Calendario de partidos
-    # --------------------------------------------------------
-
-    def cargar_calendario_partidos(self, ruta_xlsx: Path, sheet_name: str | int | None = None):
-        """
-        Lee un Excel con columnas: Fecha (obligatoria), Rival (opcional), Local_Visitante (opcional), id_rival (opcional).
-        Acepta sheet_name como nombre/índice; si es None y hay varias hojas, toma la primera no vacía.
-        """
-        raw = pd.read_excel(ruta_xlsx, sheet_name=sheet_name)
-
-        # Si viene un dict (varias hojas), elegimos la primera con columnas
-        if isinstance(raw, dict):
-            # priorizar la primera con alguna columna que parezca fecha
-            candidatos = []
-            for name, df0 in raw.items():
-                if isinstance(df0, pd.DataFrame) and len(df0.columns) > 0 and len(df0) > 0:
-                    candidatos.append((name, df0))
-            if not candidatos:
-                raise ValueError("El archivo del calendario no tiene hojas con datos.")
-            df_cal = candidatos[0][1].copy()
-        else:
-            df_cal = raw.copy()
-
-        # Identificar la columna de fecha
-        cols_lower = {c: str(c).strip().lower() for c in df_cal.columns}
-        candidatas = [c for c, s in cols_lower.items() if "fecha" in s or s in ("date",)]
-        if not candidatas:
-            raise ValueError("El calendario de partidos debe incluir una columna de fecha.")
-
-        # Normalizar fecha -> 'Fecha'
-        df_cal = df_cal.rename(columns={candidatas[0]: "Fecha"})
-        df_cal["Fecha"] = self.normalizar_fechas(df_cal["Fecha"])
-
-        # Normalizar nombres posibles
-        ren = {"Local / Visitante": "Local_Visitante", "Local-Visitante": "Local_Visitante"}
-        df_cal = df_cal.rename(columns=ren)
-
-        # Guardar para merge + set de fechas
-        keep = ["Fecha"] + [c for c in ["Rival", "Local_Visitante", "id_rival"] if c in df_cal.columns]
-        self._calendario_partidos_df = df_cal[keep].copy()
-        self._fechas_partidos = set(self._calendario_partidos_df["Fecha"].dropna().tolist())
-
-
-    # --------------------------------------------------------
-    # 3) Normalización / Cálculos
-    # --------------------------------------------------------
-
-    def _renombrar_columnas(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Versión mejorada que maneja espacios y mayúsculas"""
-        nuevos_nombres = {}
-        for col_original in df.columns:
-            # Normalizar el nombre para comparación
-            col_normalizada = (
-                str(col_original).strip().lower().replace(" ", "_").replace("-", "_"))
-            
-            # Buscar en el mapeo ignorando mayúsculas/espacios
-            for patron, destino in self.mapeo_columnas.items():
-                patron_normalizado = (
-                    str(patron).strip().lower().replace(" ", "_").replace("-", "_"))
-                if patron_normalizado == col_normalizada:
-                    nuevos_nombres[col_original] = destino
-                    break
-            else:
-                # Mantener el original si no hay match
-                nuevos_nombres[col_original] = col_original
+    
+    def transformar_archivo(self, ruta: Path) -> pd.DataFrame:  # Añade 'self' como primer parámetro
+        """Convierte formatos problemáticos antes del ETL"""
+        df = pd.read_excel(ruta)
         
-        return df.rename(columns=nuevos_nombres)
-
-    def _a_numerico(self, df, columnas=None):
-        import pandas as pd, re
-        def _to_num(x):
-            if x.dtype == "object":
-                x = (x.astype(str)
-                    .str.replace(",", ".", regex=False)
-                    .str.replace(r"[^\d\.\-]", "", regex=True))
-            return pd.to_numeric(x, errors="coerce")
-
-        if columnas is None:
-            for c in df.columns:
-                try: df[c] = _to_num(df[c])
-                except Exception: pass
-        else:
-            for c in columnas:
-                if c in df.columns:
-                    df[c] = _to_num(df[c])
+        # Convertir timestamps UTC a fecha simple
+        if 'Days' in df.columns:
+            try:
+                # Primero intentar parsear como timestamp UTC
+                df['Days'] = pd.to_datetime(
+                    df['Days'], 
+                    format='%a %b %d %H:%M:%S UTC %Y',
+                    errors='coerce'
+                )
+                
+                # Si falla, intentar otros formatos
+                if df['Days'].isna().any():
+                    df['Days'] = pd.to_datetime(
+                        df['Days'], 
+                        infer_datetime_format=True,
+                        errors='coerce'
+                    )
+                
+                # Convertir a date
+                df['Days'] = df['Days'].dt.date
+            except Exception as e:
+                print(f"[WARN] Error transformando fechas: {str(e)}")
+        
         return df
+    
+# ============================================================
+# 11- Cálculo de métricas (CE/CS/CR y Rendimiento)
+# ============================================================ 
 
+    def _serie_segura(self, df: pd.DataFrame, col: str, dtype=float) -> pd.Series:
+        """Devuelve la columna como Serie numérica con NaN→0.
+        Si no existe, devuelve una Serie de ceros con el mismo index."""
+        if col in df.columns:
+            return pd.to_numeric(df[col], errors="coerce").fillna(0).astype(dtype)
+        else:
+            return pd.Series(0, index=df.index, dtype=dtype)
 
+    def _calcular_ce_cs_cr(self, df: pd.DataFrame) -> pd.DataFrame:
+        # Componentes seguros (si no existen, series de 0)
+        dist_total = self._serie_segura(df, "Distancia_total")
+        hmld      = self._serie_segura(df, "HMLD_m")
+        hsr_abs   = self._serie_segura(df, "HSR_abs_m")
+        # fallback legacy para HSR_m si Abs no viene
+        if (hsr_abs == 0).all() and "HSR_m" in df.columns:
+            hsr_abs = self._serie_segura(df, "HSR_m")
 
+        sprints_ct   = self._serie_segura(df, "Sprints_cantidad")
+        acc3         = self._serie_segura(df, "Acc_3")
+        dec3         = self._serie_segura(df, "Dec_3")
+        player_load  = self._serie_segura(df, "Player_Load")
 
-    # --------------------------------------------------------
-    # 3.a) Cálculos Jugadores
-    # --------------------------------------------------------
+        # Distancia baja (>=0)
+        dist_baja = (dist_total - hsr_abs - hmld).clip(lower=0)
+        df["Dist_baja"] = dist_baja
 
+        # CE, CS, CR solo si no existen ya
+        if "Carga_Explosiva" not in df.columns:
+            df["Carga_Explosiva"] = hsr_abs * 1.2 + sprints_ct * 5 + acc3 * 3 + dec3 * 2.5
+
+        if "Carga_Sostenida" not in df.columns:
+            df["Carga_Sostenida"] = hmld * 1.0 + player_load * 0.2
+
+        if "Carga_Regenerativa" not in df.columns:
+            df["Carga_Regenerativa"] = dist_baja * 0.5
+
+        return df
     
     def _posicion_por_jugador(self, ids: list[int]) -> dict[int, str]:
         """Devuelve {id_jugador: Posicion} leyendo DB_Jugadores."""
@@ -1112,9 +1223,7 @@ class ETLChivas:
         denom = max(p90 - p10, 1e-6)
         z = (x.fillna(0) - p10) / denom
         return (z.clip(0, 1) * 100)
-
-    
-        
+         
     def _calcular_rendimiento_total(self, df: pd.DataFrame, destino_col: str) -> pd.DataFrame:
         
         """
@@ -1156,50 +1265,9 @@ class ETLChivas:
         df[destino_col] = pd.Series(out, index=df.index).clip(0, 100)
         return df
 
-    def _serie_segura(self, df: pd.DataFrame, col: str, dtype=float) -> pd.Series:
-        """Devuelve la columna como Serie numérica con NaN→0.
-        Si no existe, devuelve una Serie de ceros con el mismo index."""
-        if col in df.columns:
-            return pd.to_numeric(df[col], errors="coerce").fillna(0).astype(dtype)
-        else:
-            return pd.Series(0, index=df.index, dtype=dtype)
-
-
-
-    def _calcular_ce_cs_cr(self, df: pd.DataFrame) -> pd.DataFrame:
-        # Componentes seguros (si no existen, series de 0)
-        dist_total = self._serie_segura(df, "Distancia_total")
-        hmld      = self._serie_segura(df, "HMLD_m")
-        hsr_abs   = self._serie_segura(df, "HSR_abs_m")
-        # fallback legacy para HSR_m si Abs no viene
-        if (hsr_abs == 0).all() and "HSR_m" in df.columns:
-            hsr_abs = self._serie_segura(df, "HSR_m")
-
-        sprints_ct   = self._serie_segura(df, "Sprints_cantidad")
-        acc3         = self._serie_segura(df, "Acc_3")
-        dec3         = self._serie_segura(df, "Dec_3")
-        player_load  = self._serie_segura(df, "Player_Load")
-
-        # Distancia baja (>=0)
-        dist_baja = (dist_total - hsr_abs - hmld).clip(lower=0)
-        df["Dist_baja"] = dist_baja
-
-        # CE, CS, CR solo si no existen ya
-        if "Carga_Explosiva" not in df.columns:
-            df["Carga_Explosiva"] = hsr_abs * 1.2 + sprints_ct * 5 + acc3 * 3 + dec3 * 2.5
-
-        if "Carga_Sostenida" not in df.columns:
-            df["Carga_Sostenida"] = hmld * 1.0 + player_load * 0.2
-
-        if "Carga_Regenerativa" not in df.columns:
-            df["Carga_Regenerativa"] = dist_baja * 0.5
-
-        return df
-
-
-    # --------------------------------------------------------
-    # 4) Separación entrenamientos vs. partidos
-    # --------------------------------------------------------
+# ============================================================
+# 12- Clasificación “Entrenamiento vs Partido”
+# ============================================================ 
 
     def dividir_por_calendario(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """
@@ -1269,10 +1337,24 @@ class ETLChivas:
 
         return entrenos, partidos
 
+    def corregir_local_visitante(self, df_partidos, df_cal):
+        if df_partidos.empty or df_cal.empty or "Rival" not in df_partidos.columns:
+            return df_partidos
+        a = df_partidos.copy()
+        b = df_cal.copy()
+        a["R_norm"] = a["Rival"].apply(self._norm_txt_simple)
+        b["R_norm"] = b["Rival"].apply(self._norm_txt_simple)
+        a["LV_norm"] = a.get("Local_Visitante", pd.Series([None]*len(a))).apply(self._norm_txt_simple)
+        b["LV_norm"] = b.get("Local_Visitante", pd.Series([None]*len(b))).apply(self._norm_txt_simple)
+        a = a.merge(b[["Fecha","R_norm","LV_norm","Local_Visitante"]]
+                    .rename(columns={"Local_Visitante":"Local_Visitante_correcto"}),
+                    on=["Fecha","R_norm","LV_norm"], how="left")
+        a["Local_Visitante"] = a["Local_Visitante_correcto"].fillna(a["Local_Visitante"])
+        return a.drop(columns=["R_norm","LV_norm","Local_Visitante_correcto"], errors="ignore")
 
-    # --------------------------------------------------------
-    # 5) UPSERTs (cargas en DB)
-    # --------------------------------------------------------
+# ============================================================
+# 14- UPSERTs a la base
+# ============================================================ 
 
     def upsert_entrenamientos(self, df: pd.DataFrame) -> int:
         if df.empty:
@@ -1373,7 +1455,6 @@ class ETLChivas:
 
         return len(df)
 
-
     def upsert_partidos(self, df: pd.DataFrame) -> int:
         if df.empty:
             return 0
@@ -1422,9 +1503,9 @@ class ETLChivas:
             conn.executemany(sql, data)
         return len(df)
 
-    # --------------------------------------------------------
-    # 6) Rendimiento semanal (agregado)
-    # --------------------------------------------------------
+# ============================================================
+# 15- Agregaciones / Reporting en DB
+# ============================================================
 
     @staticmethod
     def _inicio_semana(serie_fechas: pd.Series) -> pd.Series:
@@ -1476,9 +1557,9 @@ class ETLChivas:
             conn.executemany(sql, data)
         return len(sem)
 
-    # --------------------------------------------------------
-    # 7) Procesamiento de archivos
-    # --------------------------------------------------------
+# ============================================================
+# 16- Procesamiento de entrenamientos (archivo y carpeta)
+# ============================================================
 
     def procesar_excel(self, ruta_xlsx: Path) -> dict:
         """
@@ -1611,7 +1692,6 @@ class ETLChivas:
             traceback.print_exc()        
         return resultado
 
-
     def procesar_carpeta(self, carpeta_raw: Path) -> dict:
         """Procesa todos los .xlsx válidos de una carpeta en una sola pasada."""
         carpeta_raw = Path(carpeta_raw)
@@ -1632,6 +1712,9 @@ class ETLChivas:
                 print(f"[ERROR] Falló {archivo.name}: {e}")
         return totales
 
+# ============================================================
+# 17- Procesamiento de partidos (archivo y carpeta)
+# ============================================================
     
     def cargar_partidos_desde_master(self, ruta_excel: Path) -> int:
         """
@@ -1833,136 +1916,21 @@ class ETLChivas:
             traceback.print_exc()
             return 0
 
-    # Métodos auxiliares (añadir a la clase ETLChivas)
+    def procesar_carpeta_partidos(self, dir_partidos: Path) -> int:
+        dir_partidos = Path(dir_partidos)
+        n_total = 0
+        for archivo in sorted(dir_partidos.glob("*.xlsx")):
+            if archivo.name.startswith("~$"):
+                continue
+            try:
+                n_total += self.cargar_partidos_desde_master(archivo)
+            except Exception as e:
+                print(f"[ERROR] Falló {archivo.name}: {e}")
+        return n_total
 
-    def _leer_y_validar_excel(self, ruta: Path) -> pd.DataFrame:
-        """Lee el Excel y valida estructura básica"""
-        engine = "openpyxl" if ruta.suffix.lower() == ".xlsx" else None
-        df = pd.read_excel(ruta, engine=engine)
-        
-        # Registrar datos crudos para diagnóstico
-        df['_raw_data'] = df.to_dict('records')
-        
-        # Detectar y eliminar duplicados exactos
-        duplicates = df.duplicated()
-        if duplicates.any():
-            print(f"[WARN] Eliminando {duplicates.sum()} filas duplicadas exactas")
-            df = df[~duplicates].copy()
-        
-        return df
-
-    def _normalizar_columnas_partidos(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Normaliza nombres de columnas con mapeo mejorado"""
-        mapeo_columnas = {
-            'fecha': ['fecha', 'date', 'match date', 'día'],
-            'nombre': ['jugador', 'player', 'nombre jugador'],
-            'rival': ['rival', 'opponent', 'equipo contrario'],
-            'duracion_min': ['duracion_min', 'minutos', 'duration (min)'],
-            'local_visitante': ['local_visitante', 'condicion', 'local/visitante']
-        }
-        
-        # Normalizar nombres de columnas
-        df.columns = [str(col).strip().lower() for col in df.columns]
-        
-        # Aplicar mapeo
-        for std_col, variants in mapeo_columnas.items():
-            for variant in variants:
-                if variant in df.columns:
-                    df[std_col] = df[variant]
-                    break
-                    
-        return df
-
-    def _filtrar_fechas_validas(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Filtra fechas en rango válido (2000-2025)"""
-        if 'fecha' not in df.columns:
-            raise ValueError("No se encontró columna de fecha")
-        
-        df['fecha'] = pd.to_datetime(df['fecha'], errors='coerce')
-        
-        # Filtrar fechas imposibles (antes de 2000 o después de 2025)
-        mask = (df['fecha'].dt.year >= 2000) & (df['fecha'].dt.year <= 2025)
-        if not mask.all():
-            invalid_count = len(df) - mask.sum()
-            print(f"[WARN] Eliminando {invalid_count} registros con fechas fuera de rango (2000-2025)")
-            df = df[mask].copy()
-        
-        return df
-
-    def _asignar_ids_jugadores(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Asigna IDs de jugadores con manejo mejorado de nombres"""
-        if 'nombre' not in df.columns:
-            raise ValueError("No se encontró columna con nombres de jugadores")
-        
-        # Convertir a formato estándar
-        df['nombre'] = df['nombre'].astype(str).str.strip()
-        
-        # Primero intentar con aliases
-        df = self._aplicar_alias_jugadores(df.rename(columns={'nombre': 'Nombre'}))
-        
-        # Luego con matching directo
-        if 'id_jugador' not in df.columns or df['id_jugador'].isna().any():
-            df = self._anexar_id_jugador_por_nombre(df)
-        
-        return df
-
-    def _normalizar_rivales(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Normaliza nombres de rivales y asigna IDs"""
-        if 'rival' not in df.columns:
-            df['rival'] = None
-        
-        # Aplicar correcciones de nombres
-        correcciones = {
-            'cincrimati': 'cincinnati',
-            'gmrcotte': 'guadalajara',
-            'zacatecas': 'zacatecas fc',
-            # Añadir más correcciones según necesidad
-        }
-        df['rival'] = df['rival'].str.lower().replace(correcciones)
-        
-        # Asignar IDs de rivales
-        df = self._adjuntar_id_rival(df)
-        
-        return df
-
-    def _completar_metricas_base(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Completa métricas faltantes con valores por defecto"""
-        metricas = [
-            'distancia_total', 'hsr_abs_m', 'hmlD_m', 'duracion_min',
-            'sprints_distancia_m', 'sprints_cantidad', 'player_load'
-        ]
-        
-        for metrica in metricas:
-            if metrica not in df.columns:
-                df[metrica] = None
-            else:
-                df[metrica] = pd.to_numeric(df[metrica], errors='coerce')
-        
-        return df
-
-    def _cargar_datos_validos(self, df: pd.DataFrame) -> int:
-        """Filtra y carga solo datos válidos"""
-        # Filtrar filas completas
-        df = df.dropna(subset=['id_jugador', 'fecha']).copy()
-        
-        # Columnas requeridas para el upsert
-        columnas_requeridas = [
-            'id_jugador', 'fecha', 'id_rival', 'rival', 'local_visitante',
-            'distancia_total', 'hsr_abs_m', 'hmlD_m', 'duracion_min'
-        ]
-        
-        # Verificar que existan todas las columnas
-        for col in columnas_requeridas:
-            if col not in df.columns:
-                df[col] = None
-        
-        # Asegurar tipos correctos
-        df['id_rival'] = pd.to_numeric(df['id_rival'], errors='coerce').astype('Int64')
-        df['local_visitante'] = df['local_visitante'].fillna('Desconocido')
-        
-        return self.upsert_partidos(df[columnas_requeridas])
-    
-    # Métodos auxiliares (añadir a la clase ETLChivas)
+# ============================================================
+# 18- Helpers específicos para partidos (validación/normalización “extra”)
+# ============================================================
 
     def _leer_y_validar_excel(self, ruta: Path) -> pd.DataFrame:
         """Lee el Excel y valida estructura básica - VERSIÓN CORREGIDA"""
@@ -2091,9 +2059,9 @@ class ETLChivas:
         
         return self.upsert_partidos(df[columnas_requeridas])
 
-    # --------------------------------------------------------
-    # 8) Cargar DB_Jugadores
-    # --------------------------------------------------------
+# ============================================================
+# 19- Carga de referencia de jugadores
+# ============================================================ 
 
     def cargar_db_jugadores(self, ruta_excel: Path) -> int:
         try:

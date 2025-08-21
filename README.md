@@ -3,8 +3,9 @@
 
 Proyecto final — **Nicolás Di Bartolo**
 
-En conjunto con el preparador físico de **Chivas de Guadalajara**, este proyecto desarrolla un **Data Warehouse** y **dashboards en Power BI** para centralizar datos de **GPS WIMU**. 
-Además, incluye un **modelo de Machine Learning** que recomienda ajustes de carga semanal tras cada partido.
+En conjunto con el preparador físico de **Chivas de Guadalajara**, este proyecto desarrolla un **Data Warehouse** y **dashboards en Power BI** para centralizar datos de **GPS WIMU**.
+Además, incluye un **modelo de Machine Learning** que recomienda ajustes de carga semanal tras cada partido, clasificando el rendimiento físico en bajo, intermedio o alto y sugiriendo carga explosiva, sostenida o regenerativa.
+
 
 ## Estructura
 ```
@@ -15,17 +16,21 @@ chivas-ml/
 │  └─ models/                     # Entrenamiento/serving
 ├─ notebooks/                     # Experimentos y análisis
 ├─ data/
-│  ├─ raw/                        # Archivos crudos (Excel del PF, etc.)
-│  ├─ external/                   # Datos externos/auxiliares
-│  └─ chivas_dw.sqlite            # Base SQLite del DW
-├─ dashboards/powerbi/            # PBIX / artefactos de Power BI
+│  ├─ raw/
+│  │   ├─ entrenamientos/         # Archivos de entrenamientos (Excel del PF)
+│  │   └─ partidos/               # Archivos de partidos jugados
+│  ├─ ref/                        # Datos auxiliares (calendario, jugadores, etc.)
+│  ├─ processed/                  # Archivos ya procesados (backup histórico)
+│  ├─ external/                   # Datos externos adicionales
+│  └─ chivas_dw.sqlite            # Base SQLite del Data Warehouse
+├─ dashboards/powerbi/            # Archivos PBIX / artefactos de Power BI
 ├─ reports/figures/               # Figuras para informes
-└─ docs/                          # PPT, diagramas, PDFs
+└─ docs/                          # Documentación, diagramas, PDFs, PPT
+
 ```
 
 ## Entorno virtual
-```bash
-# Windows (PowerShell)
+```# Windows (PowerShell)
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
@@ -36,6 +41,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 pip install -r chivas-ml/requirements.txt
+
 ```
 
 ## Variables de entorno (opcional)
@@ -46,10 +52,14 @@ DATABASE_URL=sqlite:///data/chivas_dw.sqlite
 ```
 
 ## Uso rápido
-1. Colocá tus Excels en `data/raw/` (ej.: `DB_Jugadores.xlsx`, `Carga Guadalajara.xlsx`).  
-2. Abrí `notebooks/01_etl_db_jugadores.ipynb` y corré el ETL de ejemplo.  
-3. Abrí `notebooks/02_exploracion.ipynb` para EDA y validaciones.  
-4. Diseñá los dashboards en `dashboards/powerbi/` usando `data/chivas_dw.sqlite` como fuente.
+1. Guardá los archivos en las carpetas correspondientes:
+2. `data/raw/entrenamientos/` → entrenamientos
+3. `data/raw/partidos/` → partidos jugados
+4. `data/ref/` → calendario, jugadores y datos auxiliares
+5. Corré el pipeline desde `main.py` para cargar datos al DW (`chivas_dw.sqlite`).
+6. Revisá los Jupyter Notebooks en `notebooks/` para ejemplos de ETL, EDA y validaciones.
+7. Diseñá dashboards en `dashboards/powerbi/` usando como fuente `data/chivas_dw.sqlite`.
+
 
 ## Git LFS (recomendado para .pptx y .sqlite)
 ```bash
@@ -60,6 +70,7 @@ git add .gitattributes
 
 ---
 =======
-# chivas-ml
-Sistema de análisis de carga física y rendimiento para fútbol profesional. Incluye Data Warehouse, dashboards en Power BI y un modelo de Machine Learning con datos GPS WIMU, desarrollado en conjunto con el preparador físico del Club Chivas de Guadalajara.
+# ✨ Chivas ML 
+Sistema de análisis de carga física y rendimiento para fútbol profesional.
+Integra datos de GPS WIMU en un Data Warehouse, genera reportes en Power BI y aplica Machine Learning para apoyar decisiones de planificación de entrenamientos.
 >>>>>>> e829c2a (Initial commit)
