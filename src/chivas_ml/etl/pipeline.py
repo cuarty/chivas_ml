@@ -263,38 +263,6 @@ COLUMNAS_NUMERICAS = [
 ]
 
 
-
-
-def _leer_excel_robusto(ruta):
-    """
-    Lee .xlsx con openpyxl y .xls (97-2003) con xlrd automáticamente.
-    También soporta .csv por comodidad.
-    """
-    ruta = Path(ruta)
-    suf = ruta.suffix.lower()
-
-    if suf == ".csv":
-        return pd.read_csv(ruta)
-
-    if suf == ".xlsx":
-        # .xlsx -> openpyxl
-        return pd.read_excel(ruta, engine="openpyxl")
-
-    if suf == ".xls":
-        # .xls (97-2003) -> xlrd
-        # requiere tener xlrd instalado en el venv
-        return pd.read_excel(ruta, engine="xlrd")
-
-    # fallback (por si hay extensiones raras)
-    try:
-        return pd.read_excel(ruta)  # que pandas intente elegir engine
-    except Exception as e:
-        raise RuntimeError(
-            f"No pude leer {ruta.name}. Si es .xls, asegurate de tener xlrd instalado. "
-            f"Detalle: {e}"
-        )
-
-
 # ============================================================
 # 1- Clase principal del ETL
 # ============================================================
@@ -340,9 +308,27 @@ class ETLChivas:
 
             CREATE INDEX IF NOT EXISTS idx_rend_semanal_jugador_fecha
                 ON Rendimiento_Semanal(id_jugador, Fecha);
+
+                               
+            CREATE TABLE IF NOT EXISTS DB_Lesiones (
+            id_lesion     INTEGER PRIMARY KEY AUTOINCREMENT,
+            id_jugador    INTEGER NOT NULL,
+            Fecha_inicio  DATE    NOT NULL,
+            Tipo_lesion   TEXT    NOT NULL,
+            Musculo       TEXT,
+            Lado          TEXT,
+            Tejido        TEXT,
+            Fuente        TEXT,
+            FOREIGN KEY (id_jugador) REFERENCES DB_Jugadores(id_jugador)
+            );
+                               
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_lesion_unica
+            ON DB_Lesiones(id_jugador, Fecha_inicio, Tipo_lesion, Musculo, Lado, Tejido);
+
+            CREATE INDEX IF NOT EXISTS idx_lesiones_jugador_fecha
+            ON DB_Lesiones(id_jugador, Fecha_inicio);
+
             """)
-
-
 
 # --- Constantes de clase  ---
 
@@ -1789,7 +1775,172 @@ class ETLChivas:
         return totales
 
 # ============================================================
-# 17- Procesamiento de partidos (archivo y carpeta)
+# 17- Lesiones — Ingesta y upsert (NUEVA SECCIÓN)
+# ============================================================
+
+    def _mapeo_columnas_lesiones(self, cols):
+        base = {
+            "jugador":"Nombre","player":"Nombre","nombre":"Nombre",
+            
+            "id_jugador":"id_jugador","jugador_id":"id_jugador",
+
+            "fecha":"Fecha_inicio","date":"Fecha_inicio","inicio":"Fecha_inicio",
+
+            "lesion":"Tipo_lesion","lesión":"Tipo_lesion","Lesion":"Tipo_lesion","injury":"Tipo_lesion","tipo_lesion":"Tipo_lesion",
+
+            "musculo":"Musculo","músculo":"Musculo",
+
+            "lado":"Lado",
+            
+            "tejido":"Tejido","tejido_afectado":"Tejido","tejido_afectado":"Tejido",
+
+            "fuente":"Fuente",
+        }
+        ren={}
+        for c in cols:
+            k=str(c).strip().lower().replace("-", "_").replace(" ", "_")
+            ren[c]=base.get(k, c)
+        return ren
+
+    def _leer_excel_lesiones(self, ruta: Path) -> pd.DataFrame:
+        ruta = Path(ruta)
+        if ruta.suffix.lower() == ".xls":
+            return pd.read_excel(ruta, engine="xlrd")      # Excel 97–2003
+        return pd.read_excel(ruta, engine="openpyxl")      # .xlsx moderno
+
+    def _preparar_df_lesiones(self, df: pd.DataFrame) -> pd.DataFrame:
+        if df is None or df.empty:
+            return pd.DataFrame()
+
+        df = df.rename(columns=self._mapeo_columnas_lesiones(df.columns))
+
+        # Fecha obligatoria
+        if "Fecha_inicio" in df.columns:
+            df["Fecha_inicio"] = self.normalizar_fechas(df["Fecha_inicio"])
+        else:
+            df["Fecha_inicio"] = pd.NaT
+
+        # id_jugador (por nombre si hace falta)
+        if "id_jugador" not in df.columns or df["id_jugador"].isna().all():
+            if "Nombre" in df.columns:
+                df = self._asegurar_id_jugador(df)
+            else:
+                df["id_jugador"] = pd.NA
+
+        # Tipo_lesion obligatoria
+        if "Tipo_lesion" not in df.columns:
+            df["Tipo_lesion"] = None
+        df["Tipo_lesion"] = df["Tipo_lesion"].astype(str).str.strip().replace({"": None})
+
+        # Para el UNIQUE, no dejar NULL en Musculo/Lado/Tejido → usar ''
+        for c in ["Musculo","Lado","Tejido"]:
+            if c not in df.columns:
+                df[c] = ""
+            df[c] = df[c].fillna("").astype(str).str.strip()
+
+        # Clave mínima
+        df["id_jugador"] = pd.to_numeric(df["id_jugador"], errors="coerce").astype("Int64")
+        df = df.dropna(subset=["id_jugador","Fecha_inicio","Tipo_lesion"]).copy()
+
+        cols = ["id_jugador","Fecha_inicio","Tipo_lesion","Musculo","Lado","Tejido","Fuente"]
+        return df[cols]
+
+    def upsert_lesiones(self, df: pd.DataFrame) -> int:
+        if df.empty:
+            return 0
+
+        # Normalizar tipos mínimos
+        if "Fecha_inicio" in df.columns:
+            df["Fecha_inicio"] = self.normalizar_fechas(df["Fecha_inicio"])
+
+        # Asegurar id_jugador
+        if "id_jugador" not in df.columns or df["id_jugador"].isna().any():
+            # si viene "Jugador" o "Nombre", los usamos
+            if "Jugador" in df.columns and "Nombre" not in df.columns:
+                df = df.rename(columns={"Jugador": "Nombre"})
+            if "Nombre" in df.columns:
+                df = self._anexar_id_jugador_por_nombre(df)
+                df = self._aplicar_alias_jugadores(df)
+
+        # Filtrar filas válidas
+        df = df.dropna(subset=["id_jugador", "Fecha_inicio"]).copy()
+
+        if df.empty:
+            return 0
+
+        # --- Detectar columnas reales en la tabla ---
+        with self._conectar() as conn:
+            cols_db = {row[1] for row in conn.execute("PRAGMA table_info(DB_Lesiones)")}
+        # columnas candidatas que podemos recibir del Excel
+        candidatas = [
+            "id_jugador", "Fecha_inicio",
+            "Tipo_lesion", "Musculo", "Lado", "Tejido", "Severidad",  # core
+            "Fuente"  # opcional, por si existe en tu tabla
+        ]
+        # nos quedamos solo con las que existen en la tabla Y en el df
+        cols_final = [c for c in candidatas if (c in cols_db and c in df.columns)]
+        if "id_jugador" not in cols_final or "Fecha_inicio" not in cols_final:
+            raise ValueError("DB_Lesiones debe tener al menos (id_jugador, Fecha_inicio) y venir en el dataframe.")
+
+        # preparar datos
+        df_ins = df[cols_final].where(pd.notnull(df[cols_final]), None)
+
+        # claves únicas del índice uq_lesion_unica que definiste
+        conflict_cols = ["id_jugador", "Fecha_inicio", "Tipo_lesion", "Musculo", "Lado", "Tejido"]
+        conflict_cols = [c for c in conflict_cols if c in cols_final]  # por si faltara alguna en la tabla
+
+        # columnas a actualizar en conflicto (todas menos las de conflicto)
+        set_cols = [c for c in cols_final if c not in conflict_cols]
+
+        placeholders = ",".join(["?"] * len(cols_final))
+        set_clause = ",".join([f"{c}=excluded.{c}" for c in set_cols]) if set_cols else ""
+
+        sql = f"""
+        INSERT INTO DB_Lesiones ({",".join(cols_final)})
+        VALUES ({placeholders})
+        """
+        if conflict_cols and set_clause:
+            sql += f"""
+            ON CONFLICT({",".join(conflict_cols)})
+            DO UPDATE SET {set_clause}
+            """
+
+        with self._conectar() as conn:
+            conn.executemany(sql, df_ins.values.tolist())
+
+        return len(df_ins)
+
+    def cargar_lesiones_desde_excel(self, ruta_excel: Path) -> int:
+        ruta_excel = Path(ruta_excel)
+        print(f"[INFO] Cargando lesiones desde: {ruta_excel.name}")
+        try:
+            df_raw = self._leer_excel_lesiones(ruta_excel)
+            df = self._preparar_df_lesiones(df_raw)
+            if df.empty:
+                print("[WARN] No hay filas válidas (Jugador/Fecha/Lesión).")
+                return 0
+            n = self.upsert_lesiones(df)
+            print(f"[SUCCESS] Lesiones insertadas/actualizadas: {n}")
+
+            # Archivar (opcional)
+            try:
+                fecha_ref = None
+                if "Fecha_inicio" in df.columns and not df["Fecha_inicio"].isna().all():
+                    fmin = pd.to_datetime(df["Fecha_inicio"], errors="coerce").dropna()
+                    if not fmin.empty:
+                        fecha_ref = fmin.min().date().isoformat()
+                self._archivar_archivo(ruta_excel, "lesiones", fecha_ref)
+            except Exception:
+                pass
+            return n
+        except Exception as e:
+            print(f"[ERROR] Fallo cargando {ruta_excel.name}: {e}")
+            import traceback; traceback.print_exc()
+            return 0
+
+
+# ============================================================
+# 18- Procesamiento de partidos (archivo y carpeta)
 # ============================================================
     
     def cargar_partidos_desde_master(self, ruta_excel: Path) -> int:
@@ -2012,7 +2163,7 @@ class ETLChivas:
 
 
 # ============================================================
-# 18- Helpers específicos para partidos (validación/normalización “extra”)
+# 19- Helpers específicos para partidos (validación/normalización “extra”)
 # ============================================================
 
     def _leer_y_validar_excel(self, ruta: Path) -> pd.DataFrame:

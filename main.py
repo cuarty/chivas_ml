@@ -123,13 +123,22 @@ def main():
 
     # En main.py, antes de procesar partidos:
     etl.cargar_calendario_partidos(rutas['CAL_PARTIDOS'])
-    
+
+
     # 3. Cargar jugadores (verificación exhaustiva)
     if not cargar_jugadores(etl, rutas['JUGADORES_XLSX']):
         return  # Terminar si no hay jugadores
 
     # En main.py, antes de procesar
     etl.validar_aliases()
+
+
+    # 3.1 Cargar lesiones de jugadores
+
+    ruta_lesiones = Path("data/ref/lesiones_musculares.xlsx")
+    if ruta_lesiones.exists():
+        n = etl.cargar_lesiones_desde_excel(ruta_lesiones)
+        print(f"[OK] Lesiones cargadas/actualizadas: {n}")
 
     
     # 4. ENTRENAMIENTOS (carpeta)
