@@ -1,0 +1,15 @@
+column,n_outliers,%_outliers
+velocidad_prom_m_min,9,7.2
+sprints_distancia_m,4,3.2
+sprints_cantidad,4,3.2
+hsr_abs_m,2,1.6
+carga_explosiva,1,0.8
+hsr_rel_m,1,0.8
+distancia_total,0,0.0
+hmld_m,0,0.0
+acc_3,0,0.0
+dec_3,0,0.0
+carga_sostenida,0,0.0
+carga_regenerativa,0,0.0
+rendimiento_partido,0,0.0
+duracion_min,0,0.0

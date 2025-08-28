@@ -1,157 +1,115 @@
 """
-===========================================================
- Proyecto Chivas - pipeline.py
- Autor: Nicolás Di Bartolo
- Descripción:
-     Script principal para procesar los Excel del PF, 
-     limpiar datos, separarlos entre entrenamientos y partidos,
-     calcular métricas (CE, CS, CR, Rendimiento) y cargarlos
-     en el Data Warehouse (SQLite).
-
- Índice de secciones
- ----------------------------------------------------------
-
-0) Constantes y tipos
-
-    MAPEO_COLUMNAS_POR_DEFECTO
-
-    COLUMNAS_NUMERICAS
-
-    ETLChivas._PESOS_POR_POSICION
-
-    ETLChivas.STOP_RIVAL
-
-1) Inicialización de la clase
-
-    __post_init__(self)
-
-2) Clase principal del ETL
-
-    _ class ETLChivas
-
-3) Conexión y administración de la DB (infra)
-
-    _conectar(self) -> sqlite3.Connection
-
-    _asegurar_indices(self)
-
-4) Rutas y archivado post-proceso
-
-    _dir_processed(self) -> Path
-
-    _archivar_archivo(self, src: Path, tipo: str, fecha_ref=None)
-
-5) Catálogo de rivales (aliases, normalización y consolidación)
-
-    _get_aliases_rivales_map(self)
-
-    consolidar_rivales(self)
-
-    estandarizar_rival_display_mayusculas(self)
-
-    _obtener_o_crear_id_rival(self, nombre_rival)
-
-    _adjuntar_id_rival(self, df_partidos)
-
-6) Normalización de texto y parsers utilitarios
-
-    _norm_texto(self, s, drop_tokens=None)
-
-    _norm_txt_simple(self, s)
-
-    _normalizar_txt(self, s: str) -> str (similar a las dos anteriores — podés unificarlas)
-
-    _derivar_rival_y_local(self, serie_sessions: pd.Series) -> pd.DataFrame
-
-    _inferir_fecha(self, rival, lv) (usa calendario; opcional si ya resolvés por join)
-
-    _es_chivas(self, nombre_equipo: str) -> bool
-
-    _obtener_fecha_por_rival(self, rival: str) (si mantenés este helper)
-
-7) Calendario de partidos
-
-    cargar_calendario_partidos(self, ruta_xlsx: Path, sheet_name=None)
-
-    Campo interno: self._calendario_partidos_df
-
-    Set interno: self._fechas_partidos
-
-8) Normalización de columnas y casting numérico
-
-    _renombrar_columnas(self, df: pd.DataFrame) -> pd.DataFrame
-
-    _a_numerico(self, df, columnas=None)
-
-9) Identidad de jugadores (IDs, aliases y validaciones)
-
-    _anexar_id_jugador_por_nombre(self, df)
-
-    _aplicar_alias_jugadores(self, df)
-
-    _fabricar_alias_desde_db(self) -> dict[str,int]
-
-    _resolver_id_por_alias_heuristico(self, serie_nombres: pd.Series)
-
-    _buscar_jugadores_similares(self, nombre: str, umbral=0.7)
-
-    validar_aliases(self)
-
-    _asegurar_id_jugador(self, df)
-
-10) Fechas
-
-    normalizar_fechas(serie: pd.Series) -> pd.Series (@staticmethod)
-
-    transformar_archivo(self, ruta: Path) -> pd.DataFrame (pre-ETL, corrige “Days”/UTC)
-
-11) Cálculo de métricas (CE/CS/CR y Rendimiento)
-
-    _serie_segura(self, df, col, dtype=float)
-
-    _calcular_ce_cs_cr(self, df)
-
-    _posicion_por_jugador(self, ids: list[int]) -> dict[int,str]
-
-    _percentiles_por_jugador(self, id_jugador: int) -> dict
-
-    _escala_0a100(x, p10, p90) -> pd.Series (@staticmethod)
-
-    _calcular_rendimiento_total(self, df, destino_col: str)
-
-12) Clasificación “Entrenamiento vs Partido”
-
-    dividir_por_calendario(self, df) -> (entrenos, partidos)
-
-    corregir_local_visitante(self, df_partidos, df_cal)
-
-13) UPSERTs a la base
-
-    upsert_entrenamientos(self, df)
-
-    upsert_partidos(self, df)
-
-14) Agregaciones / Reporting en DB
-
-    _inicio_semana(serie_fechas) -> pd.Series (@staticmethod)
-
-    recalcular_rendimiento_semanal(self, jugadores: Optional[Iterable[int]] = None)
-
-15) Procesamiento de entrenamientos (archivo y carpeta)
-
-    procesar_excel(self, ruta_xlsx: Path) -> dict (entrenos + recalcular semanal + archivar “entrenamientos”)
-
-    procesar_carpeta(self, carpeta_raw: Path) -> dict (itera entrenos)
-
-16) Procesamiento de partidos (archivo y carpeta)
-
-    cargar_partidos_desde_master(self, ruta_excel: Path) -> int (cruza con calendario + upsert + archiva “partidos”)
-
-    procesar_carpeta_partidos(self, dir_partidos: Path) -> int
-
-18) Carga de referencia de jugadores
-
-    cargar_db_jugadores(self, ruta_excel: Path) -> int
+ ============================================================
+ ÍNDICE (pipeline.py)
+ ============================================================
+ 00) CONSTANTES Y TIPOS
+     - MAPEO_COLUMNAS_POR_DEFECTO
+     - COLUMNAS_NUMERICAS
+     - ETLChivas._PESOS_POR_POSICION
+     - ETLChivas.STOP_RIVAL
+
+ 01) Clase principal del ETL
+     - @dataclass ETLChivas (attrs: ruta_sqlite, calendario_partidos_xlsx, mapeo_columnas)
+
+ 02) INICIALIZACIÓN DE CLASE
+     - __post_init__()
+
+ 03) Conexión y administración de la DB (infra)
+     - _conectar()
+     - _asegurar_indices()   (incluye creación de índices/tabla DB_Lesiones)
+
+ 04) Rutas y archivado post-proceso
+     - _dir_processed()
+     - _archivar_archivo()
+
+ 05) Catálogo de rivales (aliases, normalización y consolidación)
+     - _get_aliases_rivales_map()
+     - consolidar_rivales()
+     - estandarizar_rival_display_mayusculas()
+     - _obtener_o_crear_id_rival()
+     - _adjuntar_id_rival()
+
+ 06) Normalización de texto y parsers utilitarios
+     - _norm_txt_simple()
+     - _norm_texto()
+     - _normalizar_txt()
+     - _derivar_rival_y_local()
+     - _inferir_fecha()
+     - _es_chivas()
+     - _obtener_fecha_por_rival()
+     - _parsear_fecha_wimu()
+
+ 07) Calendario de partidos
+     - cargar_calendario_partidos()
+
+ 08) Normalización de columnas y casting numérico
+     - _renombrar_columnas()
+     - _a_numerico()
+
+ 09) Identidad de jugadores (IDs, aliases y validaciones)
+     - _anexar_id_jugador_por_nombre()
+     - _aplicar_alias_jugadores()
+     - _fabricar_alias_desde_db()
+     - _resolver_id_por_alias_heuristico()
+     - _buscar_jugadores_similares()
+     - validar_aliases()
+     - _asegurar_id_jugador()
+
+ 10) Fechas
+     - normalizar_fechas()      (staticmethod)
+     - transformar_archivo()
+
+ 11) Cálculo de métricas (CE/CS/CR y Rendimiento)
+     - _serie_segura()
+     - _calcular_ce_cs_cr()
+     - _posicion_por_jugador()
+     - _percentiles_por_jugador()
+     - _escala_0a100()          (staticmethod)
+     - _calcular_rendimiento_total()
+
+ 12) Clasificación “Entrenamiento vs Partido”
+     - dividir_por_calendario()
+     - corregir_local_visitante()
+
+ 14) UPSERTs a la base
+     - upsert_entrenamientos()
+     - upsert_partidos()
+
+ 15) Agregaciones / Reporting en DB
+     - _inicio_semana()         (staticmethod)
+     - recalcular_rendimiento_semanal()
+
+ 16) Procesamiento de entrenamientos (archivo y carpeta)
+     - procesar_excel()
+     - procesar_carpeta()
+
+ 17) Lesiones — Ingesta y upsert (NUEVA SECCIÓN)
+     - _mapeo_columnas_lesiones()
+     - _leer_excel_lesiones()
+     - _preparar_df_lesiones()
+     - upsert_lesiones()
+     - cargar_lesiones_desde_excel()
+
+ 18) Procesamiento de partidos (archivo y carpeta)
+     - cargar_partidos_desde_master()
+     - procesar_carpeta_partidos()
+
+ 19) Helpers específicos para partidos (validación/normalización “extra”)
+     - _leer_y_validar_excel()
+     - _normalizar_columnas_partidos()
+     - _filtrar_fechas_validas()
+     - _asignar_ids_jugadores()
+     - _normalizar_rivales()
+     - _completar_metricas_base()
+     - _cargar_datos_validos()
+
+ 20) Helper para leer excel 97-2003
+     - _detectar_formato_excel()
+     - _leer_excel_robusto()
+
+ 21) Carga de referencia de jugadores
+     - cargar_db_jugadores()
+ ============================================================
 
  Notas:
     - Los Excel originales de entrenamiento se dejan en /data/raw/entrenamientos
@@ -1497,7 +1455,7 @@ class ETLChivas:
 
         # Columnas objetivo
         columnas = [
-            "id_jugador", "Fecha", "Dia_Semana", "Tipo_Dia", "Distancia_total",
+            "id_jugador", "Fecha", "Distancia_total",
             "HSR_abs_m", "HSR_rel_m", "HMLD_m",
             "Sprints_distancia_m", "Sprints_cantidad", "Sprints_vel_max_kmh",
             "Velocidad_prom_m_min",
