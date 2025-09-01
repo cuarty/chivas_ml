@@ -288,6 +288,14 @@ class ETLChivas:
 
             """)
 
+            # --- asegurar columnas nuevas en DB_Partidos ---
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(DB_Partidos)")}
+            if "Rendimiento_Partido" not in cols:
+                conn.execute("ALTER TABLE DB_Partidos ADD COLUMN Rendimiento_Partido REAL;")
+            if "Rendimiento_vs_Entreno" not in cols:
+                conn.execute("ALTER TABLE DB_Partidos ADD COLUMN Rendimiento_vs_Entreno REAL;")
+            conn.commit()
+
 # --- Constantes de clase  ---
 
     _PESOS_POR_POSICION = {
@@ -808,6 +816,128 @@ class ETLChivas:
                     df[c] = _to_num(df[c])
                 except Exception:
                     pass
+        return df
+
+# ============================================================
+# 9- Normalización de columnas y casting numérico
+# ============================================================ 
+    def _baseline_entreno_rango(self, conn, id_jugador: int, fecha: str, dias: int):
+        sql = """
+        WITH vals AS (
+            SELECT Rendimiento_Diario AS x
+            FROM DB_Entrenamientos
+            WHERE id_jugador = ?
+            AND Fecha >= date(?, ?)
+            AND Fecha <  date(?, '+0 day')
+            AND Rendimiento_Diario IS NOT NULL
+            ORDER BY x
+        ), cnt AS (SELECT COUNT(*) c FROM vals)
+        SELECT
+        CASE
+            WHEN (SELECT c FROM cnt) = 0 THEN NULL
+            WHEN (SELECT c FROM cnt) % 2 = 1
+            THEN (SELECT x FROM vals LIMIT 1 OFFSET ((SELECT c FROM cnt)/2))
+            ELSE (
+            (SELECT x FROM vals LIMIT 1 OFFSET ((SELECT c FROM cnt)/2 - 1)) +
+            (SELECT x FROM vals LIMIT 1 OFFSET ((SELECT c FROM cnt)/2))
+            ) / 2.0
+        END AS mediana,
+        (SELECT c FROM cnt) AS n
+        """
+        delta = f"-{int(dias)} day"
+        row = conn.execute(sql, (id_jugador, fecha, delta, fecha)).fetchone()
+        mediana = float(row[0]) if row and row[0] is not None else None
+        n = int(row[1]) if row else 0
+        return mediana, n
+
+    def _baseline_entreno_historico(self, conn, id_jugador: int):
+        sql = """
+        WITH vals AS (
+            SELECT Rendimiento_Diario AS x
+            FROM DB_Entrenamientos
+            WHERE id_jugador = ? AND Rendimiento_Diario IS NOT NULL
+            ORDER BY x
+        ), cnt AS (SELECT COUNT(*) c FROM vals)
+        SELECT
+        CASE
+            WHEN (SELECT c FROM cnt) = 0 THEN NULL
+            WHEN (SELECT c FROM cnt) % 2 = 1
+            THEN (SELECT x FROM vals LIMIT 1 OFFSET ((SELECT c FROM cnt)/2))
+            ELSE (
+            (SELECT x FROM vals LIMIT 1 OFFSET ((SELECT c FROM cnt)/2 - 1)) +
+            (SELECT x FROM vals LIMIT 1 OFFSET ((SELECT c FROM cnt)/2))
+            ) / 2.0
+        END AS mediana,
+        (SELECT c FROM cnt) AS n
+        """
+        row = conn.execute(sql, (id_jugador,)).fetchone()
+        mediana = float(row[0]) if row and row[0] is not None else None
+        n = int(row[1]) if row else 0
+        return mediana, n
+
+    def _agregar_rve(self, df_partidos: pd.DataFrame) -> pd.DataFrame:
+        """
+        Agrega Rendimiento_vs_Entreno (%) y RvE_flag.
+        Usa mediana de entrenos 21d -> 60d -> histórico.
+        """
+        if df_partidos.empty:
+            df_partidos["Rendimiento_vs_Entreno"] = pd.NA
+            df_partidos["RvE_flag"] = "Sin datos"
+            return df_partidos
+
+        # Resolver columnas por alias (por si vienen en snake_case)
+        cols = {c.lower(): c for c in df_partidos.columns}
+        col_fecha = cols.get("fecha", "Fecha" if "Fecha" in df_partidos.columns else None)
+        col_rp    = cols.get("rendimiento_partido", "Rendimiento_Partido" if "Rendimiento_Partido" in df_partidos.columns else None)
+        if "id_jugador" not in df_partidos.columns or col_fecha is None or col_rp is None:
+            df = df_partidos.copy()
+            df["Rendimiento_vs_Entreno"] = pd.NA
+            df["RvE_flag"] = "Sin datos"
+            return df
+
+        df = df_partidos.copy()
+        df["Rendimiento_vs_Entreno"] = pd.NA
+        df["RvE_flag"] = "Sin datos"
+
+        with self._conectar() as conn:
+            for idx, row in df.iterrows():
+                jid = row.get("id_jugador")
+                fch = row.get(col_fecha)
+                rp  = row.get(col_rp)
+
+                if pd.isna(jid) or pd.isna(fch) or pd.isna(rp):
+                    continue
+
+                fch_dt = pd.to_datetime(fch, errors="coerce")
+                if pd.isna(fch_dt):
+                    continue
+                fch_str = fch_dt.date().isoformat()
+
+                # ---- Fallbacks: 21d -> 60d -> histórico ----
+                mediana, n = self._baseline_entreno_rango(conn, int(jid), fch_str, dias=21)
+                if mediana is None or n == 0:
+                    mediana, n = self._baseline_entreno_rango(conn, int(jid), fch_str, dias=60)
+                if mediana is None or n == 0:
+                    mediana, n = self._baseline_entreno_historico(conn, int(jid))
+
+                if mediana is not None and mediana > 0:
+                    rve = float(rp) / float(mediana) * 100.0
+                    # Si querés **guardar** el valor real pero **clipear** solo visualmente, NO sobrescribas a 250:
+                    # df.at[idx, "Rendimiento_vs_Entreno"] = rve
+                    # Acá mantengo tu lógica original (clip duro a 250):
+                    if rve > 250:
+                        df.at[idx, "Rendimiento_vs_Entreno"] = 250.0
+                        df.at[idx, "RvE_flag"] = ">250% (posible baseline bajo o pico excepcional)"
+                    elif rve < 50:
+                        df.at[idx, "Rendimiento_vs_Entreno"] = rve
+                        df.at[idx, "RvE_flag"] = "<50% (rindió mucho menos que entrenamientos)"
+                    else:
+                        df.at[idx, "Rendimiento_vs_Entreno"] = rve
+                        df.at[idx, "RvE_flag"] = "Normal"
+                else:
+                    df.at[idx, "Rendimiento_vs_Entreno"] = pd.NA
+                    df.at[idx, "RvE_flag"] = "Sin baseline suficiente"
+
         return df
 
 
@@ -1508,6 +1638,7 @@ class ETLChivas:
             "Velocidad_prom_m_min",
             "Acc_3", "Dec_3", "Player_Load", "Duracion_min",
             "Carga_Explosiva", "Carga_Sostenida", "Carga_Regenerativa", "Rendimiento_Partido",
+            "Rendimiento_vs_Entreno"
         ]
         for c in columnas:
             if c not in df.columns:
@@ -2063,6 +2194,9 @@ class ETLChivas:
             if ("Rendimiento_Partido" not in df_valido.columns) or df_valido["Rendimiento_Partido"].isna().all():
                 df_valido = self._calcular_rendimiento_total(df_valido, destino_col="Rendimiento_Partido")
 
+            # 12.b) NUEVO: calcular Rendimiento_vs_Entreno (%)
+            df_valido = self._agregar_rve(df_valido)
+
             # 13) Asegurar columnas para UPSERT (sin warnings)
             cols_partidos = [
                 "id_jugador","Fecha","id_rival","Rival","Local_Visitante","Duracion_min",
@@ -2070,7 +2204,8 @@ class ETLChivas:
                 "Sprints_distancia_m","Sprints_cantidad","Sprints_vel_max_kmh",
                 "Acc_3","Dec_3","Player_Load",
                 "Carga_Explosiva","Carga_Sostenida","Carga_Regenerativa",
-                "Rendimiento_Partido","HSR_rel_m","Velocidad_prom_m_min"
+                "Rendimiento_Partido","Rendimiento_vs_Entreno",   
+                "HSR_rel_m","Velocidad_prom_m_min"
             ]
             df_valido = df_valido.reindex(columns=cols_partidos, fill_value=None)
 
