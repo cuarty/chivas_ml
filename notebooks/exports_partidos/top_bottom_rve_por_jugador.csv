@@ -4,10 +4,10 @@ id_jugador,Fecha,Rival,Local_Visitante,RvE_pct,nombre,tipo
 4,2025-08-03,CHARLOTTE,Visitante,100.05450448901169,Alan Mozo,Bottom
 4,2025-08-07,CINCINNATI,Visitante,250.0,Alan Mozo,Top
 4,2025-08-10,SANTOS,Local,250.0,Alan Mozo,Top
-4,2025-08-22,XOLOS,Visitante,240.89156202419187,Alan Mozo,Top
+4,2025-08-16,C. JUAREZ,Local,250.0,Alan Mozo,Top
 23,2025-07-19,LEON,Visitante,250.0,Alan Pulido,Bottom
 23,2025-07-26,SAN LUIS,Local,250.0,Alan Pulido,Bottom
-23,2025-08-16,C. JUAREZ,Local,50.34742955944268,Alan Pulido,Bottom
+23,2025-08-16,C. JUAREZ,Local,70.73269131399857,Alan Pulido,Bottom
 23,2025-07-19,LEON,Visitante,250.0,Alan Pulido,Top
 23,2025-07-26,SAN LUIS,Local,250.0,Alan Pulido,Top
 23,2025-07-31,NEW YORK RB,Visitante,250.0,Alan Pulido,Top
@@ -16,52 +16,52 @@ id_jugador,Fecha,Rival,Local_Visitante,RvE_pct,nombre,tipo
 29,2025-07-19,LEON,Visitante,5.819170790663095,Armando González,Bottom
 29,2025-08-07,CINCINNATI,Visitante,250.0,Armando González,Top
 29,2025-08-10,SANTOS,Visitante,250.0,Armando González,Top
-29,2025-08-22,XOLOS,Visitante,250.0,Armando González,Top
+29,2025-08-16,C. JUAREZ,Local,250.0,Armando González,Top
+7,2025-07-31,NEW YORK RB,Visitante,184.85597640196792,Bryan González,Bottom
 7,2025-07-19,LEON,Visitante,179.44563275832263,Bryan González,Bottom
 7,2025-07-26,SAN LUIS,Local,169.9998009274388,Bryan González,Bottom
-7,2025-08-16,C. JUAREZ,Local,152.92419986960903,Bryan González,Bottom
-7,2025-08-22,XOLOS,Visitante,246.2407619435874,Bryan González,Top
+7,2025-08-22,XOLOS,Visitante,250.0,Bryan González,Top
+7,2025-08-30,CRUZ AZUL,Local,250.0,Bryan González,Top
 7,2025-08-10,SANTOS,Visitante,229.24691204790753,Bryan González,Top
-7,2025-08-07,CINCINNATI,Visitante,220.93781771756912,Bryan González,Top
-22,2025-07-31,NEW YORK RB,Visitante,101.75908986677888,Cade Cowell,Bottom
+22,2025-08-30,CRUZ AZUL,Local,91.77108615108708,Cade Cowell,Bottom
 22,2025-08-10,SANTOS,Visitante,8.51606312082527,Cade Cowell,Bottom
 22,2025-08-03,CHARLOTTE,Visitante,0.0,Cade Cowell,Bottom
 22,2025-07-19,LEON,Visitante,250.0,Cade Cowell,Top
-22,2025-08-22,XOLOS,Visitante,223.89941616820335,Cade Cowell,Top
-22,2025-08-16,C. JUAREZ,Local,181.97377494628256,Cade Cowell,Top
+22,2025-08-22,XOLOS,Visitante,250.0,Cade Cowell,Top
+22,2025-08-16,C. JUAREZ,Local,190.24835321255992,Cade Cowell,Top
 19,2025-07-19,LEON,Visitante,250.0,Daniel Aguirre,Bottom
 19,2025-07-26,SAN LUIS,Local,250.0,Daniel Aguirre,Bottom
-19,2025-08-22,XOLOS,Visitante,114.61732113673895,Daniel Aguirre,Bottom
+19,2025-07-31,NEW YORK RB,Visitante,250.0,Daniel Aguirre,Bottom
 19,2025-07-19,LEON,Visitante,250.0,Daniel Aguirre,Top
 19,2025-07-26,SAN LUIS,Local,250.0,Daniel Aguirre,Top
 19,2025-07-31,NEW YORK RB,Visitante,250.0,Daniel Aguirre,Top
 9,2025-07-26,SAN LUIS,Local,176.5661595345323,Diego Campillo,Bottom
 9,2025-07-31,NEW YORK RB,Visitante,107.70451878925624,Diego Campillo,Bottom
 9,2025-07-19,LEON,Visitante,50.62422681824344,Diego Campillo,Bottom
-9,2025-08-07,CINCINNATI,Visitante,244.31550091675697,Diego Campillo,Top
-9,2025-08-10,SANTOS,Visitante,239.26538192751417,Diego Campillo,Top
-9,2025-08-03,CHARLOTTE,Visitante,225.77525178178382,Diego Campillo,Top
+9,2025-08-16,C. JUAREZ,Local,250.0,Diego Campillo,Top
+9,2025-08-22,XOLOS,Visitante,250.0,Diego Campillo,Top
+9,2025-08-30,CRUZ AZUL,Local,250.0,Diego Campillo,Top
+15,2025-08-16,C. JUAREZ,Local,157.92000577814676,Efraín Álvarez,Bottom
 15,2025-07-26,SAN LUIS,Local,151.44963087985636,Efraín Álvarez,Bottom
-15,2025-08-16,C. JUAREZ,Local,120.9967970299205,Efraín Álvarez,Bottom
 15,2025-07-19,LEON,Visitante,85.73764061357595,Efraín Álvarez,Bottom
 15,2025-08-07,CINCINNATI,Visitante,250.0,Efraín Álvarez,Top
 15,2025-08-10,SANTOS,Visitante,250.0,Efraín Álvarez,Top
 15,2025-08-22,XOLOS,Visitante,250.0,Efraín Álvarez,Top
-17,2025-08-16,C. JUAREZ,Local,243.4721431222418,Erick Gutiérrez,Bottom
+17,2025-07-26,SAN LUIS,Local,250.0,Erick Gutiérrez,Bottom
 17,2025-07-19,LEON,Visitante,220.41471928284997,Erick Gutiérrez,Bottom
 17,2025-08-10,SANTOS,Visitante,124.42232985695307,Erick Gutiérrez,Bottom
 17,2025-07-26,SAN LUIS,Local,250.0,Erick Gutiérrez,Top
 17,2025-07-31,NEW YORK RB,Visitante,250.0,Erick Gutiérrez,Top
-17,2025-08-22,XOLOS,Visitante,250.0,Erick Gutiérrez,Top
+17,2025-08-16,C. JUAREZ,Local,250.0,Erick Gutiérrez,Top
 5,2025-07-31,NEW YORK RB,Visitante,250.0,Gilberto Sepulveda,Bottom
 5,2025-08-10,SANTOS,Visitante,241.2939700048831,Gilberto Sepulveda,Bottom
 5,2025-08-03,CHARLOTTE,Visitante,215.0694407014927,Gilberto Sepulveda,Bottom
 5,2025-07-31,NEW YORK RB,Visitante,250.0,Gilberto Sepulveda,Top
 5,2025-08-07,CINCINNATI,Visitante,250.0,Gilberto Sepulveda,Top
-5,2025-08-10,SANTOS,Visitante,241.2939700048831,Gilberto Sepulveda,Top
-26,2025-07-19,LEON,Visitante,99.04233264695145,Hugo Camberos,Bottom
-26,2025-08-16,C. JUAREZ,Local,43.54046572157469,Hugo Camberos,Bottom
+5,2025-08-22,XOLOS,Visitante,250.0,Gilberto Sepulveda,Top
+26,2025-08-16,C. JUAREZ,Local,48.69473058932275,Hugo Camberos,Bottom
 26,2025-07-26,SAN LUIS,Local,16.257319922402722,Hugo Camberos,Bottom
+26,2025-08-30,CRUZ AZUL,Local,0.0,Hugo Camberos,Bottom
 26,2025-08-10,SANTOS,Visitante,170.64214210049963,Hugo Camberos,Top
 26,2025-08-07,CINCINNATI,Visitante,147.21157162279718,Hugo Camberos,Top
 26,2025-07-19,LEON,Visitante,99.04233264695145,Hugo Camberos,Top
@@ -71,10 +71,12 @@ id_jugador,Fecha,Rival,Local_Visitante,RvE_pct,nombre,tipo
 16,2025-08-22,XOLOS,Visitante,250.0,Isaác Brisuela,Top
 24,2025-08-16,C. JUAREZ,Local,250.0,Javier Hernández,Bottom
 24,2025-08-22,XOLOS,Visitante,250.0,Javier Hernández,Bottom
+24,2025-08-30,CRUZ AZUL,Local,105.23153279793137,Javier Hernández,Bottom
 24,2025-08-16,C. JUAREZ,Local,250.0,Javier Hernández,Top
 24,2025-08-22,XOLOS,Visitante,250.0,Javier Hernández,Top
+24,2025-08-30,CRUZ AZUL,Local,105.23153279793137,Javier Hernández,Top
 10,2025-07-26,SAN LUIS,Local,250.0,José Castillo,Bottom
-10,2025-08-16,C. JUAREZ,Local,175.5406410034469,José Castillo,Bottom
+10,2025-08-16,C. JUAREZ,Local,232.87125448811716,José Castillo,Bottom
 10,2025-07-19,LEON,Visitante,175.0415635028202,José Castillo,Bottom
 10,2025-07-26,SAN LUIS,Local,250.0,José Castillo,Top
 10,2025-07-31,NEW YORK RB,Visitante,250.0,José Castillo,Top
@@ -89,14 +91,16 @@ id_jugador,Fecha,Rival,Local_Visitante,RvE_pct,nombre,tipo
 18,2025-07-19,LEON,Visitante,250.0,Luis Romo,Top
 18,2025-07-26,SAN LUIS,Local,250.0,Luis Romo,Top
 18,2025-07-31,NEW YORK RB,Visitante,250.0,Luis Romo,Top
-11,2025-08-22,XOLOS,Visitante,30.695682207199525,Miguel Gómez,Bottom
+11,2025-08-30,CRUZ AZUL,Local,41.43334243101735,Miguel Gómez,Bottom
 11,2025-08-03,CHARLOTTE,Visitante,18.476550365541335,Miguel Gómez,Bottom
 11,2025-08-16,C. JUAREZ,Local,4.506945008271214,Miguel Gómez,Bottom
 11,2025-08-07,CINCINNATI,Visitante,72.99768457488572,Miguel Gómez,Top
-11,2025-08-22,XOLOS,Visitante,30.695682207199525,Miguel Gómez,Top
-11,2025-08-03,CHARLOTTE,Visitante,18.476550365541335,Miguel Gómez,Top
-6,2025-08-22,XOLOS,Visitante,182.8393926178775,Miguel Tapias,Bottom
-6,2025-08-22,XOLOS,Visitante,182.8393926178775,Miguel Tapias,Top
+11,2025-08-22,XOLOS,Visitante,65.76060870935092,Miguel Gómez,Top
+11,2025-08-30,CRUZ AZUL,Local,41.43334243101735,Miguel Gómez,Top
+6,2025-08-22,XOLOS,Visitante,250.0,Miguel Tapias,Bottom
+6,2025-08-30,CRUZ AZUL,Local,250.0,Miguel Tapias,Bottom
+6,2025-08-22,XOLOS,Visitante,250.0,Miguel Tapias,Top
+6,2025-08-30,CRUZ AZUL,Local,250.0,Miguel Tapias,Top
 14,2025-07-19,LEON,Visitante,250.0,Omar Govea,Bottom
 14,2025-07-26,SAN LUIS,Local,250.0,Omar Govea,Bottom
 14,2025-07-19,LEON,Visitante,250.0,Omar Govea,Top
@@ -115,27 +119,29 @@ id_jugador,Fecha,Rival,Local_Visitante,RvE_pct,nombre,tipo
 21,2025-07-31,NEW YORK RB,Visitante,250.0,Richard Ledezma,Top
 21,2025-08-03,CHARLOTTE,Visitante,250.0,Richard Ledezma,Top
 21,2025-08-10,SANTOS,Visitante,250.0,Richard Ledezma,Top
+25,2025-07-19,LEON,Visitante,200.51311171585886,Roberto Alvarado,Bottom
 25,2025-07-26,SAN LUIS,Local,200.03998093142928,Roberto Alvarado,Bottom
-25,2025-08-16,C. JUAREZ,Local,169.7329189409193,Roberto Alvarado,Bottom
-25,2025-08-22,XOLOS,Visitante,117.08445099442197,Roberto Alvarado,Bottom
+25,2025-08-22,XOLOS,Visitante,190.33651756620966,Roberto Alvarado,Bottom
 25,2025-08-10,SANTOS,Visitante,250.0,Roberto Alvarado,Top
-25,2025-08-03,CHARLOTTE,Visitante,208.70952987159853,Roberto Alvarado,Top
-25,2025-07-31,NEW YORK RB,Visitante,200.98848588629176,Roberto Alvarado,Top
+25,2025-08-16,C. JUAREZ,Local,250.0,Roberto Alvarado,Top
+25,2025-08-30,CRUZ AZUL,Local,208.90508462401806,Roberto Alvarado,Top
 20,2025-08-07,CINCINNATI,Visitante,250.0,Rubén González,Bottom
 20,2025-07-31,NEW YORK RB,Visitante,27.49611275995296,Rubén González,Bottom
 20,2025-08-07,CINCINNATI,Visitante,250.0,Rubén González,Top
 20,2025-07-31,NEW YORK RB,Visitante,27.49611275995296,Rubén González,Top
 31,2025-08-10,SANTOS,Visitante,116.5219258847633,Santiago Sandoval,Bottom
-31,2025-08-16,C. JUAREZ,Local,21.048405093852665,Santiago Sandoval,Bottom
+31,2025-08-16,C. JUAREZ,Local,33.16413165827961,Santiago Sandoval,Bottom
 31,2025-07-19,LEON,Visitante,0.0,Santiago Sandoval,Bottom
-31,2025-08-22,XOLOS,Visitante,123.70174828370646,Santiago Sandoval,Top
+31,2025-08-22,XOLOS,Visitante,153.97408525872024,Santiago Sandoval,Top
+31,2025-08-30,CRUZ AZUL,Local,150.48854501146462,Santiago Sandoval,Top
 31,2025-08-10,SANTOS,Visitante,116.5219258847633,Santiago Sandoval,Top
-31,2025-08-16,C. JUAREZ,Local,21.048405093852665,Santiago Sandoval,Top
 27,2025-08-16,C. JUAREZ,Local,241.08549014559722,Teun Wilke,Bottom
 27,2025-08-07,CINCINNATI,Visitante,10.12865297162281,Teun Wilke,Bottom
 27,2025-08-16,C. JUAREZ,Local,241.08549014559722,Teun Wilke,Top
 27,2025-08-07,CINCINNATI,Visitante,10.12865297162281,Teun Wilke,Top
 28,2025-08-07,CINCINNATI,Visitante,250.0,Yael Padilla,Bottom
 28,2025-08-03,CHARLOTTE,Visitante,102.62860781260473,Yael Padilla,Bottom
+28,2025-08-30,CRUZ AZUL,Local,12.699350198097637,Yael Padilla,Bottom
 28,2025-08-07,CINCINNATI,Visitante,250.0,Yael Padilla,Top
 28,2025-08-03,CHARLOTTE,Visitante,102.62860781260473,Yael Padilla,Top
+28,2025-08-30,CRUZ AZUL,Local,12.699350198097637,Yael Padilla,Top
