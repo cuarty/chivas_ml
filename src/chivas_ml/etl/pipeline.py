@@ -819,7 +819,7 @@ class ETLChivas:
         return df
 
 # ============================================================
-# 9- Normalización de columnas y casting numérico
+# 9- Agregación Rendimiento vs Partido DB_Partidos
 # ============================================================ 
     def _baseline_entreno_rango(self, conn, id_jugador: int, fecha: str, dias: int):
         sql = """

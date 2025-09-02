@@ -135,7 +135,7 @@ def main():
 
     # 3.1 Cargar lesiones de jugadores
 
-    ruta_lesiones = Path("data/ref/lesiones_musculares.xlsx")
+    ruta_lesiones = Path("data/raw/lesiones/lesiones_musculares.xlsx")
     if ruta_lesiones.exists():
         n = etl.cargar_lesiones_desde_excel(ruta_lesiones)
         print(f"[OK] Lesiones cargadas/actualizadas: {n}")
