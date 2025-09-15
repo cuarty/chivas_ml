@@ -135,6 +135,7 @@ import traceback
 from fuzzywuzzy import fuzz, process
 from datetime import datetime
 import shutil
+import time
 
 
 
@@ -248,12 +249,26 @@ class ETLChivas:
 # ============================================================  
 
     def _conectar(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.ruta_sqlite)
-        conn.execute("PRAGMA foreign_keys = ON;")
+        # Asegurar que el directorio existe
+        self.ruta_sqlite.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Configuración robusta de conexión
+        conn = sqlite3.connect(
+            str(self.ruta_sqlite),  # Asegurar que es string
+            timeout=60,
+            check_same_thread=False
+        )
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA busy_timeout=10000;")  # 10 segundos
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute("PRAGMA foreign_keys=ON;")
+        conn.execute("PRAGMA cache_size=10000;")
         return conn
+
 
     def _asegurar_indices(self):
         with self._conectar() as conn:
+            # ---- índices/tablas base ----
             conn.executescript("""
             CREATE UNIQUE INDEX IF NOT EXISTS uq_ent_jugador_fecha
                 ON DB_Entrenamientos(id_jugador, Fecha);
@@ -267,34 +282,54 @@ class ETLChivas:
             CREATE INDEX IF NOT EXISTS idx_rend_semanal_jugador_fecha
                 ON Rendimiento_Semanal(id_jugador, Fecha);
 
-                               
             CREATE TABLE IF NOT EXISTS DB_Lesiones (
-            id_lesion     INTEGER PRIMARY KEY AUTOINCREMENT,
-            id_jugador    INTEGER NOT NULL,
-            Fecha_inicio  DATE    NOT NULL,
-            Tipo_lesion   TEXT    NOT NULL,
-            Musculo       TEXT,
-            Lado          TEXT,
-            Tejido        TEXT,
-            Fuente        TEXT,
-            FOREIGN KEY (id_jugador) REFERENCES DB_Jugadores(id_jugador)
+                id_lesion     INTEGER PRIMARY KEY AUTOINCREMENT,
+                id_jugador    INTEGER NOT NULL,
+                Fecha_inicio  DATE    NOT NULL,
+                Tipo_lesion   TEXT    NOT NULL,
+                Musculo       TEXT,
+                Lado          TEXT,
+                Tejido        TEXT,
+                Fuente        TEXT,
+                FOREIGN KEY (id_jugador) REFERENCES DB_Jugadores(id_jugador)
             );
-                               
+
             CREATE UNIQUE INDEX IF NOT EXISTS uq_lesion_unica
-            ON DB_Lesiones(id_jugador, Fecha_inicio, Tipo_lesion, Musculo, Lado, Tejido);
+                ON DB_Lesiones(id_jugador, Fecha_inicio, Tipo_lesion, Musculo, Lado, Tejido);
 
             CREATE INDEX IF NOT EXISTS idx_lesiones_jugador_fecha
-            ON DB_Lesiones(id_jugador, Fecha_inicio);
+                ON DB_Lesiones(id_jugador, Fecha_inicio);
 
+            CREATE INDEX IF NOT EXISTS idx_entrenos_jugador_fecha  ON DB_Entrenamientos(id_jugador, Fecha);
+            CREATE INDEX IF NOT EXISTS idx_partidos_jugador_fecha ON DB_Partidos(id_jugador, Fecha);
             """)
 
-            # --- asegurar columnas nuevas en DB_Partidos ---
+            # ---- columnas nuevas en DB_Partidos ----
             cols = {row[1] for row in conn.execute("PRAGMA table_info(DB_Partidos)")}
-            if "Rendimiento_Partido" not in cols:
-                conn.execute("ALTER TABLE DB_Partidos ADD COLUMN Rendimiento_Partido REAL;")
-            if "Rendimiento_vs_Entreno" not in cols:
-                conn.execute("ALTER TABLE DB_Partidos ADD COLUMN Rendimiento_vs_Entreno REAL;")
+            def add(col, sqltype):
+                if col not in cols:
+                    conn.execute(f"ALTER TABLE DB_Partidos ADD COLUMN {col} {sqltype};")
+
+            add("Rendimiento_Partido",   "REAL")
+            add("Rendimiento_Intensidad","REAL")
+            add("RvE_Intensidad",        "REAL")
+            add("Rendimiento_vs_Entreno","REAL")
+            add("CE_prev7d",             "REAL")
+            add("CS_prev7d",             "REAL")
+            add("CR_prev7d",             "REAL")
+            # ACWR / sobrecarga
+            add("CT_7d",                 "REAL")
+            add("CT_28d_avg",            "REAL")
+            add("ACWR_raw",              "REAL")
+            add("ACWR_pct",              "REAL")
+            add("ACWR_flag",             "TEXT")
+
+
+            
             conn.commit()
+
+
+            
 
 # --- Constantes de clase  ---
 
@@ -320,37 +355,49 @@ class ETLChivas:
         return self.ruta_sqlite.parent.parent / "processed"
 
     def _archivar_archivo(self, src: Path, tipo: str, fecha_ref=None):
-        """
-        Mueve el archivo a data/processed/<tipo>/AAAA-MM-DD_nombre.xlsx.
-        - fecha_ref: date o str 'AAAA-MM-DD' (si no viene, usa mtime del archivo)
-        - evita sobreescrituras agregando sufijo _1, _2, ...
-        """
         base = self._dir_processed()
         destino_dir = base / tipo
         destino_dir.mkdir(parents=True, exist_ok=True)
 
+        # fecha
         if fecha_ref is None:
             ts = datetime.fromtimestamp(src.stat().st_mtime)
             fecha_str = ts.strftime("%Y-%m-%d")
         else:
-            if isinstance(fecha_ref, str):
-                fecha_str = fecha_ref
-            else:
-                fecha_str = datetime.strptime(str(fecha_ref), "%Y-%m-%d").strftime("%Y-%m-%d")
+            fecha_str = str(fecha_ref)[:10]
 
-        nombre_final = f"{fecha_str}_{src.name}"
+        # nombre limpio y corto (máx ~80 chars sin extensión)
+        stem = re.sub(r"\s+", "_", src.stem)
+        stem = re.sub(r"[^A-Za-z0-9_\-]", "", stem)
+        stem = re.sub(r"(?:\d{4}-\d{2}-\d{2}_)+", "", stem)  # quita repeticiones de fechas
+        stem = stem[:80]  # recorte duro
+
+        nombre_final = f"{fecha_str}_{stem}{src.suffix}"
         destino = destino_dir / nombre_final
 
-        # Evitar pisar archivos si el mismo nombre ya existe
-        if destino.exists():
-            stem = destino.stem
-            suf = 1
-            while destino.exists():
-                destino = destino_dir / f"{stem}_{suf}{destino.suffix}"
-                suf += 1
+        # evitar colisiones
+        suf = 1
+        while destino.exists():
+            destino = destino_dir / f"{fecha_str}_{stem}_{suf}{src.suffix}"
+            suf += 1
 
-        shutil.move(str(src), str(destino))
-        print(f"[ARCHIVO] Movido a {destino.relative_to(self.ruta_sqlite.parent.parent)}")
+        # si el origen ya no existe, salgo elegante
+        if not src.exists():
+            print(f"[WARN] No pude archivar: origen no existe: {src}")
+            return
+
+        try:
+            shutil.move(str(src), str(destino))
+            print(f"[ARCHIVO] Movido a {destino.relative_to(self.ruta_sqlite.parent.parent)}")
+        except FileNotFoundError:
+            # típicamente por path largo -> fallback a copy+remove con nombre más corto
+            try:
+                shutil.copy2(str(src), str(destino))
+                src.unlink(missing_ok=True)
+                print(f"[ARCHIVO] Copiado (fallback) a {destino.relative_to(self.ruta_sqlite.parent.parent)}")
+            except Exception as e:
+                print(f"[ERROR] No pude archivar {src.name}: {e}")
+
 
 # ============================================================
 # 5- Catálogo de rivales (aliases, normalización y consolidación)
@@ -382,96 +429,109 @@ class ETLChivas:
         return aliases_map
 
     def consolidar_rivales(self):
-        import pandas as pd, sqlite3
+        max_intentos = 3
+        intento = 0
+        
+        while intento < max_intentos:
+            try:
+                # Usar with statement para asegurar que la conexión se cierra
+                with self._conectar() as con:
+                    con.execute("PRAGMA foreign_keys=ON")
+                    
+                    # 0) asegurar columna
+                    cols = {row[1] for row in con.execute("PRAGMA table_info(DB_Rivales)")}
+                    if "Nombre_norm" not in cols:
+                        con.execute("ALTER TABLE DB_Rivales ADD COLUMN Nombre_norm TEXT")
+                        con.commit()
 
-        con = sqlite3.connect(self.ruta_sqlite)
-        con.execute("PRAGMA foreign_keys=ON")
+                    # 0.b) quitar índice UNIQUE si existe
+                    con.execute("DROP INDEX IF EXISTS uq_rivales_nombre_norm")
+                    con.commit()
 
-        # 0) asegurar columna
-        cols = {row[1] for row in con.execute("PRAGMA table_info(DB_Rivales)")}
-        if "Nombre_norm" not in cols:
-            con.execute("ALTER TABLE DB_Rivales ADD COLUMN Nombre_norm TEXT")
-            con.commit()
+                    # 1) cargar rivales y RE-CALCULAR SIEMPRE clave canónica
+                    df = pd.read_sql("SELECT id_rival, Nombre FROM DB_Rivales", con)
+                    df["Nombre_norm"] = df["Nombre"].apply(
+                        lambda s: self._norm_texto(s, drop_tokens=self.STOP_RIVAL)
+                    )
 
-        # 0.b) quitar índice UNIQUE si existe (para poder recalcular sin violar UNIQUE)
-        con.execute("DROP INDEX IF EXISTS uq_rivales_nombre_norm")
-        con.commit()
+                    # 2) persistir Nombre_norm recalculado
+                    for _id, _norm in df[["id_rival","Nombre_norm"]].itertuples(index=False):
+                        con.execute("UPDATE DB_Rivales SET Nombre_norm=? WHERE id_rival=?", (_norm, _id))
+                    con.commit()
 
-        # 1) cargar rivales y RE-CALCULAR SIEMPRE clave canónica
-        df = pd.read_sql("SELECT id_rival, Nombre FROM DB_Rivales", con)
-        df["Nombre_norm"] = df["Nombre"].apply(
-            lambda s: self._norm_texto(s, drop_tokens=self.STOP_RIVAL)
-        )
+                    # 3) agrupar duplicados por Nombre_norm
+                    grupos = (df.dropna(subset=["Nombre_norm"])
+                                .groupby("Nombre_norm")["id_rival"].apply(list))
 
-        # 2) persistir Nombre_norm recalculado
-        for _id, _norm in df[["id_rival","Nombre_norm"]].itertuples(index=False):
-            con.execute("UPDATE DB_Rivales SET Nombre_norm=? WHERE id_rival=?", (_norm, _id))
-        con.commit()
+                    # columnas para “calidad” de fila de partidos (más no-nulos = mejor)
+                    metric_cols = [
+                        "Distancia_total","HSR_abs_m","HMLD_m","Sprints_distancia_m","Sprints_cantidad",
+                        "Sprints_vel_max_kmh","Acc_3","Dec_3","Player_Load","Carga_Explosiva",
+                        "Carga_Sostenida","Carga_Regenerativa","Rendimiento_Partido","Duracion_min",
+                        "HSR_rel_m","Velocidad_prom_m_min"
+                    ]
 
-        # 3) agrupar duplicados por Nombre_norm
-        grupos = (df.dropna(subset=["Nombre_norm"])
-                    .groupby("Nombre_norm")["id_rival"].apply(list))
+                    for _, ids in grupos.items():
+                        if len(ids) <= 1:
+                            continue
+                        keep = min(ids)                  # conservamos el menor id
+                        to_merge = [i for i in ids if i != keep]
+                        ids_all = [keep] + to_merge
 
-        # columnas para “calidad” de fila de partidos (más no-nulos = mejor)
-        metric_cols = [
-            "Distancia_total","HSR_abs_m","HMLD_m","Sprints_distancia_m","Sprints_cantidad",
-            "Sprints_vel_max_kmh","Acc_3","Dec_3","Player_Load","Carga_Explosiva",
-            "Carga_Sostenida","Carga_Regenerativa","Rendimiento_Partido","Duracion_min",
-            "HSR_rel_m","Velocidad_prom_m_min"
-        ]
+                        # 4) traer partidos afectados y resolver choques del UNIQUE (jugador, fecha, rival)
+                        q = ",".join("?"*len(ids_all))
+                        part = pd.read_sql(f"""
+                            SELECT id_partido, id_jugador, Fecha, id_rival, {",".join(metric_cols)}
+                            FROM DB_Partidos
+                            WHERE id_rival IN ({q})
+                        """, con, params=ids_all)
 
-        for _, ids in grupos.items():
-            if len(ids) <= 1:
-                continue
-            keep = min(ids)                  # conservamos el menor id
-            to_merge = [i for i in ids if i != keep]
-            ids_all = [keep] + to_merge
+                        if not part.empty:
+                            part["key"] = (part["id_jugador"].astype(str) + "|" +
+                                        part["Fecha"].astype(str) + "|" + str(keep))
+                            part["nn"] = part[metric_cols].notna().sum(axis=1)
+                            # conservamos por key la fila más “rica”
+                            keep_ids = (part.sort_values(["key","nn","Duracion_min"], ascending=[True, False, False])
+                                            .groupby("key")["id_partido"].first().tolist())
+                            del_ids = part[~part["id_partido"].isin(keep_ids)]["id_partido"].tolist()
+                            if del_ids:
+                                con.executemany("DELETE FROM DB_Partidos WHERE id_partido=?", [(i,) for i in del_ids])
 
-            # 4) traer partidos afectados y resolver choques del UNIQUE (jugador, fecha, rival)
-            q = ",".join("?"*len(ids_all))
-            part = pd.read_sql(f"""
-                SELECT id_partido, id_jugador, Fecha, id_rival, {",".join(metric_cols)}
-                FROM DB_Partidos
-                WHERE id_rival IN ({q})
-            """, con, params=ids_all)
+                        # 5) actualizar rivales en partidos y borrar duplicados en catálogo
+                        if to_merge:
+                            marks = ",".join("?"*len(to_merge))
+                            con.execute(f"UPDATE DB_Partidos SET id_rival=? WHERE id_rival IN ({marks})", (keep, *to_merge))
+                            con.execute(f"DELETE FROM DB_Rivales WHERE id_rival IN ({marks})", (*to_merge,))
+                        con.commit()
 
-            if not part.empty:
-                part["key"] = (part["id_jugador"].astype(str) + "|" +
-                            part["Fecha"].astype(str) + "|" + str(keep))
-                part["nn"] = part[metric_cols].notna().sum(axis=1)
-                # conservamos por key la fila más “rica”
-                keep_ids = (part.sort_values(["key","nn","Duracion_min"], ascending=[True, False, False])
-                                .groupby("key")["id_partido"].first().tolist())
-                del_ids = part[~part["id_partido"].isin(keep_ids)]["id_partido"].tolist()
-                if del_ids:
-                    con.executemany("DELETE FROM DB_Partidos WHERE id_partido=?", [(i,) for i in del_ids])
+                    # 6) recrear índice UNIQUE por la clave canónica
+                    con.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_rivales_nombre_norm ON DB_Rivales(Nombre_norm)")
+                    con.commit()
+                
+                break
 
-            # 5) actualizar rivales en partidos y borrar duplicados en catálogo
-            if to_merge:
-                marks = ",".join("?"*len(to_merge))
-                con.execute(f"UPDATE DB_Partidos SET id_rival=? WHERE id_rival IN ({marks})", (keep, *to_merge))
-                con.execute(f"DELETE FROM DB_Rivales WHERE id_rival IN ({marks})", (*to_merge,))
-            con.commit()
+            except sqlite3.OperationalError as e:
+                if "locked" in str(e).lower() and intento < max_intentos - 1:
+                    intento += 1
+                    print(f"[WARN] Base bloqueada, reintento {intento}/{max_intentos}")
+                    time.sleep(3 * intento)  # Espera progresiva
+                    continue
+                else:
+                    print(f"[ERROR] No se pudo consolidar rivales después de {max_intentos} intentos: {e}")
+                    raise
 
-        # 6) recrear índice UNIQUE por la clave canónica
-        con.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_rivales_nombre_norm ON DB_Rivales(Nombre_norm)")
-        con.commit()
-        con.close()
 
     def estandarizar_rival_display_mayusculas(self):
-        import sqlite3
-        con = sqlite3.connect(self.ruta_sqlite)
-        con.execute("PRAGMA foreign_keys=ON")
-        # si no hay id_rival, dejamos Rival en NULL
-        con.execute("""
-            UPDATE DB_Partidos AS p
-            SET Rival = UPPER( (SELECT r.Nombre FROM DB_Rivales r WHERE r.id_rival = p.id_rival) )
-            WHERE p.id_rival IS NOT NULL
-        """)
-        # limpiar rivales huérfanos (sin id_rival), opcional:
-        con.execute("UPDATE DB_Partidos SET Rival = NULL WHERE id_rival IS NULL")
-        con.commit()
-        con.close()
+        with self._conectar() as con:
+            con.execute("PRAGMA foreign_keys=ON")
+            con.execute("""
+                UPDATE DB_Partidos AS p
+                SET Rival = UPPER((SELECT r.Nombre FROM DB_Rivales r WHERE r.id_rival = p.id_rival))
+                WHERE p.id_rival IS NOT NULL
+            """)
+            con.execute("UPDATE DB_Partidos SET Rival = NULL WHERE id_rival IS NULL")
+            # no hace falta close()
+
 
     def _obtener_o_crear_id_rival(self, nombre_rival):
         import sqlite3
@@ -875,6 +935,55 @@ class ETLChivas:
         n = int(row[1]) if row else 0
         return mediana, n
 
+    def _baseline_entreno_rd_rango(self, conn, jid, fch_str, dias):
+            sql = """
+            WITH vals AS (
+                SELECT Rendimiento_Diario AS x
+                FROM DB_Entrenamientos
+                WHERE id_jugador = ?
+                AND Fecha >= date(?, ?)
+                AND Fecha <  date(?, '+0 day')
+                AND Rendimiento_Diario IS NOT NULL
+                ORDER BY x
+            ), cnt AS (SELECT COUNT(*) c FROM vals)
+            SELECT
+            CASE WHEN (SELECT c FROM cnt)=0 THEN NULL
+                WHEN (SELECT c FROM cnt)%2=1
+                    THEN (SELECT x FROM vals LIMIT 1 OFFSET ((SELECT c FROM cnt)/2))
+                ELSE ((SELECT x FROM vals LIMIT 1 OFFSET ((SELECT c FROM cnt)/2 - 1)) +
+                    (SELECT x FROM vals LIMIT 1 OFFSET ((SELECT c FROM cnt)/2))) / 2.0
+            END AS mediana,
+            (SELECT c FROM cnt) AS n
+            """
+            delta = f"-{int(dias)} day"
+            row = conn.execute(sql, (jid, fch_str, delta, fch_str)).fetchone()
+            mediana = float(row[0]) if row and row[0] is not None else None
+            n = int(row[1]) if row else 0
+            return mediana, n
+
+    def _baseline_entreno_rd_hist(self, conn, jid):
+        sql = """
+        WITH vals AS (
+            SELECT Rendimiento_Diario AS x
+            FROM DB_Entrenamientos
+            WHERE id_jugador = ? AND Rendimiento_Diario IS NOT NULL
+            ORDER BY x
+        ), cnt AS (SELECT COUNT(*) c FROM vals)
+        SELECT
+        CASE WHEN (SELECT c FROM cnt)=0 THEN NULL
+            WHEN (SELECT c FROM cnt)%2=1
+                THEN (SELECT x FROM vals LIMIT 1 OFFSET ((SELECT c FROM cnt)/2))
+            ELSE ((SELECT x FROM vals LIMIT 1 OFFSET ((SELECT c FROM cnt)/2 - 1)) +
+                (SELECT x FROM vals LIMIT 1 OFFSET ((SELECT c FROM cnt)/2))) / 2.0
+        END AS mediana,
+        (SELECT c FROM cnt) AS n
+        """
+        row = conn.execute(sql, (jid,)).fetchone()
+        mediana = float(row[0]) if row and row[0] is not None else None
+        n = int(row[1]) if row else 0
+        return mediana, n
+
+
     def _agregar_rve(self, df_partidos: pd.DataFrame) -> pd.DataFrame:
         """
         Agrega Rendimiento_vs_Entreno (%) y RvE_flag.
@@ -940,6 +1049,52 @@ class ETLChivas:
 
         return df
 
+    def _agregar_rve_intensidad(self, df_partidos: pd.DataFrame, conn: sqlite3.Connection) -> pd.DataFrame:
+        """
+        Calcula RvE_Intensidad (%) = 100 * Rendimiento_Intensidad / baseline_entreno
+        Baseline = mediana de Rendimiento_Diario en 21d -> 60d -> histórico.
+        Requiere columnas: id_jugador, Fecha, Rendimiento_Intensidad
+        """
+        if df_partidos.empty:
+            df_partidos["RvE_Intensidad"] = pd.NA
+            return df_partidos
+
+        req = {"id_jugador", "Fecha", "Rendimiento_Intensidad"}
+        if not req.issubset(df_partidos.columns):
+            df = df_partidos.copy()
+            df["RvE_Intensidad"] = pd.NA
+            return df
+
+        df = df_partidos.copy()
+        df["RvE_Intensidad"] = pd.NA
+
+        for idx, row in df.iterrows():
+            jid = row.get("id_jugador")
+            fch = row.get("Fecha")
+            rint = row.get("Rendimiento_Intensidad")
+            if pd.isna(jid) or pd.isna(fch) or pd.isna(rint):
+                continue
+
+            fch_dt = pd.to_datetime(fch, errors="coerce")
+            if pd.isna(fch_dt):
+                continue
+            fch_str = fch_dt.date().isoformat()
+
+            # fallbacks 21d -> 60d -> hist (usando tus helpers ya definidos arriba)
+            mediana, n = self._baseline_entreno_rd_rango(conn, int(jid), fch_str, dias=21)
+            if mediana is None or n == 0:
+                mediana, n = self._baseline_entreno_rd_rango(conn, int(jid), fch_str, dias=60)
+            if mediana is None or n == 0:
+                mediana, n = self._baseline_entreno_rd_hist(conn, int(jid))
+
+            if mediana and mediana > 0:
+                df.at[idx, "RvE_Intensidad"] = float(rint) / float(mediana) * 100.0
+            else:
+                df.at[idx, "RvE_Intensidad"] = pd.NA
+
+        return df
+
+
 
 # ============================================================
 # 9- Identidad de jugadores (IDs, aliases y validaciones)
@@ -975,53 +1130,59 @@ class ETLChivas:
         return m
 
     def _aplicar_alias_jugadores(self, df: pd.DataFrame) -> pd.DataFrame:
-        # Cargar aliases con manejo de mayúsculas/espacios
+        """Aplica aliases de manera robusta"""
+        if 'Nombre' not in df.columns and 'Players' in df.columns:
+            df = df.rename(columns={'Players': 'Nombre'})
+        
+        if 'Nombre' not in df.columns:
+            return df
+            
+        # Cargar aliases
         alias_path = Path("data/ref/aliases_jugadores.csv")
-        aliases = pd.read_csv(alias_path)
-        
-        # Crear mapeo normalizado
-        alias_dict = {}
-        for _, row in aliases.iterrows():
-            # Todas las variantes posibles
-            nombres = [
-                str(row['Nombre_Fuente']).strip(),
-                str(row['Nombre_Fuente']).strip().upper(),
-                str(row['Nombre_Fuente']).strip().title()
-            ]
-            for nombre in nombres:
-                alias_dict[self._norm_texto(nombre)] = row['id_jugador']
-        
-        # Aplicar aliases
-        df['nombre_norm'] = df['Nombre'].apply(self._norm_texto)
-        df['id_jugador'] = df['id_jugador'].fillna(df['nombre_norm'].map(alias_dict))
-        
-        return df.drop(columns=['nombre_norm'], errors='ignore')
+        if not alias_path.exists():
+            print(f"[WARN] No existe archivo de aliases: {alias_path}")
+            return df
+            
+        try:
+            aliases = pd.read_csv(alias_path)
+            alias_dict = {}
+            
+            # Crear mapeo case-insensitive
+            for _, row in aliases.iterrows():
+                fuente = str(row['Nombre_Fuente']).strip().lower()
+                alias_dict[fuente] = row['id_jugador']
+                
+            # Aplicar aliases
+            df['nombre_normalizado'] = df['Nombre'].astype(str).str.strip().str.lower()
+            
+            # Crear columna id_jugador si no existe
+            if 'id_jugador' not in df.columns:
+                df['id_jugador'] = pd.NA
+                
+            # Mapear aliases
+            df['id_jugador'] = df['id_jugador'].fillna(
+                df['nombre_normalizado'].map(alias_dict)
+            )
+            
+            return df.drop(columns=['nombre_normalizado'], errors='ignore')
+            
+        except Exception as e:
+            print(f"[ERROR] Error aplicando aliases: {e}")
+            return df
 
     def _fabricar_alias_desde_db(self) -> dict[str, int]:
-        """
-        Construye {alias_norm -> id_jugador} a partir de DB_Jugadores.
-        Alias cubiertos:
-        - apellido ("brizuela")
-        - nombre apellido ("isaac brizuela")
-        - inicial + apellido ("i brizuela", "ibrizuela")
-        - nombre de pila único ("bryan", si no hay dos Bryan)
-        - variantes sin acentos, minúsculas, colapsando espacios
-        Alias ambiguos (colisionan entre jugadores) se descartan.
-        """
+        """Versión mejorada que maneja mejor los apellidos solos"""
         with self._conectar() as conn:
             ref = pd.read_sql("SELECT id_jugador, Nombre FROM DB_Jugadores", conn)
 
-        # conteo de nombres de pila para saber si son únicos
-        def norm(s): return self._norm_texto(s)
+        def norm(s): 
+            return self._norm_texto(s) if s else ""
+        
         ref["Nombre_norm"] = ref["Nombre"].astype(str).map(norm)
-        ref["Nombre_pila"] = ref["Nombre_norm"].str.split().str[0].fillna("")
-        counts_pila = ref["Nombre_pila"].value_counts()
-
         alias2id, colisiones = {}, set()
 
         def add_alias(k, vid):
-            if not k:
-                return
+            if not k: return
             if k in alias2id and alias2id[k] != vid:
                 colisiones.add(k)
             else:
@@ -1029,25 +1190,25 @@ class ETLChivas:
 
         for _, row in ref.iterrows():
             jid = int(row["id_jugador"])
-            base = row["Nombre_norm"]              # "isaac brizuela"
-            if not base: 
-                continue
-            toks = base.split()
+            nombre_completo = row["Nombre_norm"]
+            if not nombre_completo: continue
+            
+            toks = nombre_completo.split()
             nombre_pila = toks[0] if toks else ""
             apellido = toks[-1] if toks else ""
-
-            # variantes principales
+            
+            # APELLIDOS EN MAYÚSCULAS (para casos como 'ALVARADO')
+            apellido_mayus = apellido.upper() if apellido else ""
+            
+            # Variantes principales
             cand = {
-                base,                               # "isaac brizuela"
-                apellido,                           # "brizuela"
+                nombre_completo,           # "isaac brizuela"
+                apellido,                  # "brizuela" 
+                apellido_mayus,            # "BRIZUELA" (MAYÚSCULAS)
+                nombre_pila,               # "isaac"
                 (nombre_pila[:1] + " " + apellido) if nombre_pila else "",  # "i brizuela"
                 (nombre_pila[:1] + apellido) if nombre_pila else "",        # "ibrizuela"
-                apellido.replace(" ", ""),          # por si apellidos compuestos
             }
-
-            # nombre de pila único (p.ej. "bryan") -> solo si no es ambiguo
-            if nombre_pila and counts_pila.get(nombre_pila, 0) == 1:
-                cand.add(nombre_pila)
 
             for a in cand:
                 a = a.strip()
@@ -1061,42 +1222,49 @@ class ETLChivas:
         return alias2id
 
     def _resolver_id_por_alias_heuristico(self, serie_nombres: pd.Series) -> pd.Series:
-        """
-        Resuelve id_jugador usando los alias fabricados.
-        Cubre casos como 'ALVARADO', 'Brizuela', 'D Aguirre', 'GSepulveda', 'Efrain', 'Bryan', 'Govea'.
-        """
+        """Resuelve IDs con matching fuzzy mejorado para partidos"""
         if serie_nombres is None or serie_nombres.empty:
-            return pd.Series(pd.NA, index=(serie_nombres.index if serie_nombres is not None else []), dtype="Int64")
-
-        alias2id = self._fabricar_alias_desde_db()
-        if not alias2id:
             return pd.Series(pd.NA, index=serie_nombres.index, dtype="Int64")
 
-        def resolver(raw):
-            n = self._norm_texto(raw)                # lower, sin acentos, colapsa espacios
-            if not n:
+        # Cargar todos los jugadores de la DB
+        with self._conectar() as conn:
+            jugadores_db = pd.read_sql("SELECT id_jugador, Nombre FROM DB_Jugadores", conn)
+        
+        # Crear lista de nombres para fuzzy matching
+        nombres_db = jugadores_db['Nombre'].tolist()
+        id_map = dict(zip(jugadores_db['Nombre'], jugadores_db['id_jugador']))
+        
+        def encontrar_jugador(nombre_input):
+            nombre_input = str(nombre_input).strip()
+            if not nombre_input:
                 return pd.NA
-
-            # 1) match directo
-            if n in alias2id:
-                return alias2id[n]
-
-            # 2) "gsepulveda" -> "g sepulveda"
-            if len(n) >= 2 and n[0].isalpha():
-                n2 = n[0] + " " + n[1:]
-                if n2 in alias2id:
-                    return alias2id[n2]
-
-            # 3) si viene "d. aguirre" u otras con puntos
-            n3 = n.replace(".", " ")
-            n3 = re.sub(r"\s+", " ", n3).strip()
-            if n3 in alias2id:
-                return alias2id[n3]
-
+            
+            # 1. Buscar coincidencia exacta primero
+            for nombre_db, jid in id_map.items():
+                if nombre_input.lower() == nombre_db.lower():
+                    return jid
+            
+            # 2. Buscar por apellido solamente
+            for nombre_db, jid in id_map.items():
+                apellido_db = nombre_db.split()[-1].lower() if ' ' in nombre_db else nombre_db.lower()
+                if nombre_input.lower() == apellido_db:
+                    return jid
+            
+            # 3. Fuzzy matching como último recurso
+            try:
+                mejor_coincidencia, score = process.extractOne(
+                    nombre_input, 
+                    nombres_db, 
+                    scorer=fuzz.token_sort_ratio
+                )
+                if score >= 70:  # Umbral de similitud
+                    return id_map[mejor_coincidencia]
+            except:
+                pass
+            
             return pd.NA
-
-        out = serie_nombres.astype(str).map(resolver).astype("Int64")
-        return out
+        
+        return serie_nombres.apply(encontrar_jugador)
        
     def _buscar_jugadores_similares(self, nombre: str, umbral=0.7) -> list[dict]:
         """
@@ -1387,10 +1555,16 @@ class ETLChivas:
 
     @staticmethod
     def _escala_0a100(x: pd.Series, p10: float, p90: float) -> pd.Series:
-        # Normaliza por percentiles y recorta a [0, 100]
+        """
+        Normaliza por percentiles:
+        - p10 = referencia mínima
+        - p90 = referencia máxima
+        Puede devolver valores >100 si el jugador rinde por encima de su histórico.
+        """
         denom = max(p90 - p10, 1e-6)
         z = (x.fillna(0) - p10) / denom
-        return (z.clip(0, 1) * 100)
+        return (z * 100)  # <-- SIN clip
+
          
     def _calcular_rendimiento_total(self, df: pd.DataFrame, destino_col: str) -> pd.DataFrame:
         
@@ -1427,11 +1601,75 @@ class ETLChivas:
 
             pos = pos_por_j.get(jid, "")
             w = self._PESOS_POR_POSICION.get(pos, self._PESOS_POR_POSICION["_default"])
+
             score = ce_n * w[0] + cs_n * w[1] + cr_n * w[2]
+
             out.append(score)
 
         df[destino_col] = pd.Series(out, index=df.index).clip(0, 100)
         return df
+
+    def _calcular_rendimiento_partido_hibrido(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Calcula:
+        - Rendimiento_Intensidad (0–100): usando CE/CS/CR por minuto + percentiles por jugador.
+        - Rendimiento_Partido (0–100 ajustado por minutos): score total * (min/90).
+        Requiere: Carga_Explosiva, Carga_Sostenida, Carga_Regenerativa, Minutos_jugados.
+        """
+        if df.empty:
+            df["Rendimiento_Intensidad"] = np.nan
+            df["Rendimiento_Partido"] = np.nan
+            return df
+
+        # Asegurar columnas mínimas
+        for c in ["Carga_Explosiva","Carga_Sostenida","Carga_Regenerativa"]:
+            if c not in df.columns:
+                df[c] = np.nan
+
+        # 👉 minutos: preferir Duracion_min, si no, Minutos_jugados
+        mins_col = "Duracion_min" if "Duracion_min" in df.columns else "Minutos_jugados"
+        mins = pd.to_numeric(df.get(mins_col, 0), errors="coerce").fillna(0)
+        mins_safe = mins.clip(lower=1)
+
+        # --- INTENSIDAD: CE/CS/CR por minuto (evitar /0)
+        mins = pd.to_numeric(df["Duracion_min"], errors="coerce").fillna(0)
+        mins_safe = mins.clip(lower=1)
+        ce_pm = df["Carga_Explosiva"]    / mins_safe
+        cs_pm = df["Carga_Sostenida"]    / mins_safe
+        cr_pm = df["Carga_Regenerativa"] / mins_safe
+
+        # ---- Normalización 0–100 usando percentiles POR MINUTO
+        ids = df.get("id_jugador", pd.Series(dtype=int)).dropna().astype(int).unique().tolist()
+        pos_por_j = self._posicion_por_jugador(ids)
+        perc_cache = {jid: self._percentiles_por_jugador(jid) for jid in ids}
+
+        rint = []
+        for i, row in df.iterrows():
+            jid = int(row["id_jugador"]) if pd.notna(row.get("id_jugador")) else -1
+            P = perc_cache.get(jid, {"CE": (0,1), "CS": (0,1), "CR": (0,1)})
+            # Derivar percentiles por minuto ≈ percentiles de totales / 90
+            p10_ce, p90_ce = P["CE"][0]/90.0, P["CE"][1]/90.0
+            p10_cs, p90_cs = P["CS"][0]/90.0, P["CS"][1]/90.0
+            p10_cr, p90_cr = P["CR"][0]/90.0, P["CR"][1]/90.0
+
+            ce_n = float(self._escala_0a100(pd.Series([ce_pm.loc[i]]), p10_ce, p90_ce).iloc[0])
+            cs_n = float(self._escala_0a100(pd.Series([cs_pm.loc[i]]), p10_cs, p90_cs).iloc[0])
+            cr_n = float(self._escala_0a100(pd.Series([cr_pm.loc[i]]), p10_cr, p90_cr).iloc[0])
+
+            pos = pos_por_j.get(jid, "")
+            w = self._PESOS_POR_POSICION.get(pos, self._PESOS_POR_POSICION["_default"])
+            rint.append(ce_n*w[0] + cs_n*w[1] + cr_n*w[2])
+
+        df["Rendimiento_Intensidad"] = pd.Series(rint, index=df.index)
+
+        # --- TOTAL (igual que ya tenías)
+        tmp2 = df.copy()
+        tmp2 = self._calcular_rendimiento_total(tmp2, destino_col="__R_TOT__")
+        factor_min = (mins.clip(lower=1) / 90.0).astype(float)
+        df["Rendimiento_Partido"] = (tmp2["__R_TOT__"].astype(float) * factor_min)
+        
+        return df
+
 
 # ============================================================
 # 12- Clasificación “Entrenamiento vs Partido”
@@ -1621,9 +1859,24 @@ class ETLChivas:
             data = df[columnas].where(pd.notnull(df[columnas]), None).values.tolist()
             conn.executemany(sql, data)
 
+        # Recalcular sobrecargas solo para lo afectado
+        try:
+            ids_jug = df["id_jugador"].dropna().astype(int).unique().tolist()
+            fmin = pd.to_datetime(df["Fecha"], errors="coerce").min()
+            fmax = pd.to_datetime(df["Fecha"], errors="coerce").max()
+            fmin_str = fmin.date().isoformat() if pd.notnull(fmin) else None
+            fmax_str = fmax.date().isoformat() if pd.notnull(fmax) else None
+
+            # Y SIEMPRE: sobrecargas (CT_7d, CT_28d_avg, ACWR)
+            self._actualizar_sobrecargas(
+                jugadores=ids_jug, fecha_desde=fmin_str, fecha_hasta=fmax_str
+            )
+        except Exception as e:
+            print(f"[WARN] No se pudieron recalcular sobrecargas tras entrenos: {e}")
+
         return len(df)
 
-    def upsert_partidos(self, df: pd.DataFrame) -> int:
+    def upsert_partidos(self, df: pd.DataFrame, conn: sqlite3.Connection | None = None) -> int:
         if df.empty:
             return 0
         
@@ -1632,45 +1885,57 @@ class ETLChivas:
                 raise ValueError(f"Falta columna obligatoria '{c}' para DB_Partidos.")
 
         columnas = [
-            "id_jugador", "Fecha", "id_rival", "Rival", "Local_Visitante", "Distancia_total",
-            "HSR_abs_m", "HSR_rel_m", "HMLD_m",
-            "Sprints_distancia_m", "Sprints_cantidad", "Sprints_vel_max_kmh",
-            "Velocidad_prom_m_min",
-            "Acc_3", "Dec_3", "Player_Load", "Duracion_min",
-            "Carga_Explosiva", "Carga_Sostenida", "Carga_Regenerativa", "Rendimiento_Partido",
-            "Rendimiento_vs_Entreno"
+            "id_jugador","Fecha","id_rival","Rival","Local_Visitante","Duracion_min",
+            "Distancia_total","HSR_abs_m","HMLD_m",
+            "Sprints_distancia_m","Sprints_cantidad","Sprints_vel_max_kmh",
+            "Acc_3","Dec_3","Player_Load",
+            "Carga_Explosiva","Carga_Sostenida","Carga_Regenerativa",
+            "Rendimiento_Partido","Rendimiento_Intensidad","RvE_Intensidad",
+            "HSR_rel_m","Velocidad_prom_m_min"
         ]
+        
         for c in columnas:
             if c not in df.columns:
-                df = df.copy()              # una vez antes del for
+                df = df.copy()
                 df.loc[:, c] = None
 
-        if hasattr(self, "_calendario_partidos_df"):
-            df = df.merge(
-                self._calendario_partidos_df[["Fecha", "Rival", "Local_Visitante"]],
-                on=["Fecha", "Rival"],
-                how="left",
-                suffixes=("", "_cal")
-            )
-            df["Local_Visitante"] = df["Local_Visitante_cal"].fillna(df["Local_Visitante"])
-            df = df.drop(columns=["Local_Visitante_cal"])
-                
-        # tipos consistentes
-        df["id_rival"] = pd.to_numeric(df["id_rival"], errors="coerce").astype("Int64")
+        placeholders = ",".join(["?"] * len(columnas))
+        set_clause = ",".join([f"{c}=excluded.{c}" for c in columnas if c != "id_partido"])
+        sql = f"""
+        INSERT INTO DB_Partidos ({",".join(columnas)})
+        VALUES ({placeholders})
+        ON CONFLICT(id_jugador, Fecha, ifnull(id_rival,-1))
+        DO UPDATE SET {set_clause};
+        """
+        
+        data = df[columnas].where(pd.notnull(df[columnas]), None).values.tolist()
 
-
-        with self._conectar() as conn:
-            placeholders = ",".join(["?"] * len(columnas))
-            set_clause = ",".join([f"{c}=excluded.{c}" for c in columnas if c != "id_partido"])
-            sql = f"""
-            INSERT INTO DB_Partidos ({",".join(columnas)})
-            VALUES ({placeholders})
-            ON CONFLICT(id_jugador, Fecha, ifnull(id_rival,-1))
-            DO UPDATE SET {set_clause};
-            """
-            data = df[columnas].where(pd.notnull(df[columnas]), None).values.tolist()
+        # 🔥 CAMBIO CRÍTICO: Manejar la conexión correctamente
+        if conn is None:
+            with self._conectar() as _c:
+                _c.executemany(sql, data)
+                n_inserted = len(data)
+        else:
+            # Usar la conexión existente
             conn.executemany(sql, data)
-        return len(df)
+            n_inserted = len(data)
+
+        # Recalcular sobrecargas solo si hay inserciones
+        if n_inserted > 0:
+            try:
+                ids_jug = df["id_jugador"].dropna().astype(int).unique().tolist()
+                fmin = pd.to_datetime(df["Fecha"], errors="coerce").min()
+                fmax = pd.to_datetime(df["Fecha"], errors="coerce").max()
+                fmin_str = fmin.date().isoformat() if pd.notnull(fmin) else None
+                fmax_str = fmax.date().isoformat() if pd.notnull(fmax) else None
+
+                self._actualizar_sobrecargas(
+                    jugadores=ids_jug, fecha_desde=fmin_str, fecha_hasta=fmax_str
+                )
+            except Exception as e:
+                print(f"[WARN] No se pudieron recalcular sobrecargas tras partidos: {e}")
+
+        return n_inserted
 
 # ============================================================
 # 15- Agregaciones / Reporting en DB
@@ -1725,6 +1990,157 @@ class ETLChivas:
             data = sem[columnas].where(pd.notnull(sem[columnas]), None).values.tolist()
             conn.executemany(sql, data)
         return len(sem)
+
+
+
+    def _actualizar_sobrecargas(self, jugadores=None, fecha_desde=None, fecha_hasta=None) -> None:
+        import time, sqlite3
+
+        where, params = [], []
+
+        if jugadores:
+            marca = ",".join("?" for _ in jugadores)
+            where.append(f"p.id_jugador IN ({marca})")
+            params.extend(list(map(int, jugadores)))
+
+        if fecha_desde:
+            where.append("date(p.Fecha) >= ?"); params.append(fecha_desde)
+        if fecha_hasta:
+            where.append("date(p.Fecha) <= ?"); params.append(fecha_hasta)
+
+        filtro = ("WHERE " + " AND ".join(where)) if where else ""
+
+        sqls = [
+            # --- CE_prev7d
+            f"""UPDATE DB_Partidos AS p
+                SET CE_prev7d = (
+                    SELECT COALESCE(SUM(e.Carga_Explosiva),0)
+                    FROM DB_Entrenamientos e
+                    WHERE e.id_jugador = p.id_jugador
+                    AND e.Fecha >= date(p.Fecha,'-7 day')
+                    AND e.Fecha  <  date(p.Fecha)
+                )
+                {filtro};""",
+
+            # --- CS_prev7d
+            f"""UPDATE DB_Partidos AS p
+                SET CS_prev7d = (
+                    SELECT COALESCE(SUM(e.Carga_Sostenida),0)
+                    FROM DB_Entrenamientos e
+                    WHERE e.id_jugador = p.id_jugador
+                    AND e.Fecha >= date(p.Fecha,'-7 day')
+                    AND e.Fecha  <  date(p.Fecha)
+                )
+                {filtro};""",
+
+            # --- CR_prev7d
+            f"""UPDATE DB_Partidos AS p
+                SET CR_prev7d = (
+                    SELECT COALESCE(SUM(e.Carga_Regenerativa),0)
+                    FROM DB_Entrenamientos e
+                    WHERE e.id_jugador = p.id_jugador
+                    AND e.Fecha >= date(p.Fecha,'-7 day')
+                    AND e.Fecha  <  date(p.Fecha)
+                )
+                {filtro};""",
+
+            # --- CT_7d, CT_28d_avg, ACWR y ACWR_pct (0–100)
+            f"""UPDATE DB_Partidos AS p
+                SET
+                CT_7d = COALESCE(CE_prev7d,0)+COALESCE(CS_prev7d,0)+COALESCE(CR_prev7d,0),
+                CT_28d_avg = (
+                    SELECT CASE WHEN COUNT(*)=0 THEN NULL ELSE AVG(x.CT) END
+                    FROM (
+                    SELECT (COALESCE(e.Carga_Explosiva,0)+COALESCE(e.Carga_Sostenida,0)+COALESCE(e.Carga_Regenerativa,0)) AS CT
+                    FROM DB_Entrenamientos e
+                    WHERE e.id_jugador = p.id_jugador
+                        AND e.Fecha >= date(p.Fecha,'-28 day')
+                        AND e.Fecha  <  date(p.Fecha)
+                    ) x
+                ),
+                ACWR = CASE
+                        WHEN (
+                            SELECT COUNT(*)
+                            FROM DB_Entrenamientos e
+                            WHERE e.id_jugador = p.id_jugador
+                            AND e.Fecha >= date(p.Fecha,'-28 day')
+                            AND e.Fecha  <  date(p.Fecha)
+                        ) = 0
+                        THEN NULL
+                        ELSE (
+                            COALESCE(CE_prev7d,0)+COALESCE(CS_prev7d,0)+COALESCE(CR_prev7d,0)
+                        ) / (
+                            SELECT AVG(x.CT)
+                            FROM (
+                            SELECT (COALESCE(e.Carga_Explosiva,0)+COALESCE(e.Carga_Sostenida,0)+COALESCE(e.Carga_Regenerativa,0)) AS CT
+                            FROM DB_Entrenamientos e
+                            WHERE e.id_jugador = p.id_jugador
+                                AND e.Fecha >= date(p.Fecha,'-28 day')
+                                AND e.Fecha  <  date(p.Fecha)
+                            ) x
+                        )
+                        END,
+                ACWR_pct = CASE
+                            WHEN (
+                                SELECT COUNT(*)
+                                FROM DB_Entrenamientos e
+                                WHERE e.id_jugador = p.id_jugador
+                                AND e.Fecha >= date(p.Fecha,'-28 day')
+                                AND e.Fecha  <  date(p.Fecha)
+                            ) = 0
+                            THEN NULL
+                            ELSE 100.0 * (
+                                (
+                                COALESCE(CE_prev7d,0)+COALESCE(CS_prev7d,0)+COALESCE(CR_prev7d,0)
+                                ) / (
+                                SELECT AVG(x.CT)
+                                FROM (
+                                    SELECT (COALESCE(e.Carga_Explosiva,0)+COALESCE(e.Carga_Sostenida,0)+COALESCE(e.Carga_Regenerativa,0)) AS CT
+                                    FROM DB_Entrenamientos e
+                                    WHERE e.id_jugador = p.id_jugador
+                                    AND e.Fecha >= date(p.Fecha,'-28 day')
+                                    AND e.Fecha  <  date(p.Fecha)
+                                ) x
+                                )
+                            )
+                            END
+                {filtro};""",
+
+            # --- ACWR_flag (con alias también)
+            f"""UPDATE DB_Partidos AS p
+                SET ACWR_flag = CASE
+                    WHEN ACWR_pct IS NULL THEN 'Sin baseline'
+                    WHEN ACWR_pct < 80   THEN 'Baja'
+                    WHEN ACWR_pct <= 130 THEN 'Óptima'
+                    WHEN ACWR_pct <= 150 THEN 'Alta'
+                    ELSE 'Muy alta'
+                END
+                {filtro};"""
+        ]
+
+
+        for intento in range(3):  # Reintentar hasta 3 veces
+            try:
+                with self._conectar() as conn:
+                    cur = conn.cursor()
+                    for q in sqls:
+                        try:
+                            cur.execute(q, params)
+                        except sqlite3.OperationalError as e:
+                            if "locked" in str(e).lower() and intento < 4:
+                                time.sleep(0.5 * (intento + 1))  # Esperar progresivamente
+                                continue
+                            raise
+                    conn.commit()
+                break
+            except sqlite3.OperationalError as e:
+                if "locked" in str(e).lower() and intento < 4:
+                    time.sleep(1 * (intento + 1))
+                    continue
+                raise
+
+
+
 
 # ============================================================
 # 16- Procesamiento de entrenamientos (archivo y carpeta)
@@ -1797,9 +2213,19 @@ class ETLChivas:
                 print(entrenos[['Nombre', 'id_jugador', 'Fecha', 'Carga_Explosiva', 'Carga_Sostenida']].head(3))
 
                 n_entrenos = self.upsert_entrenamientos(entrenos)
-                resultado['entrenamientos'] = n_entrenos
-            else:
-                print("[DEBUG] No hay entrenamientos en este archivo.")
+
+                n_entrenos = self.upsert_entrenamientos(entrenos)
+
+            # Atualizar sobrecargas (prev7d + CT_7d + CT_28d_avg + ACWR)
+            if n_entrenos > 0:
+                ids = entrenos['id_jugador'].dropna().astype(int).unique().tolist()
+                fmax = pd.to_datetime(entrenos['Fecha'], errors='coerce').max()
+                fmax_str = fmax.date().isoformat() if pd.notnull(fmax) else None
+                fplus7 = (fmax + pd.Timedelta(days=7)).date().isoformat() if pd.notnull(fmax) else None
+                self._actualizar_sobrecargas(jugadores=ids, fecha_desde=fmax_str, fecha_hasta=fplus7)
+
+            resultado['entrenamientos'] = n_entrenos
+
 
             # 8) Procesar partidos (si estás en Opción A: solo log)
             if not partidos.empty:
@@ -2046,14 +2472,34 @@ class ETLChivas:
             # 2. Eliminar duplicados
             df = df.drop_duplicates()
             
+            # DEBUG: Mostrar nombres problemáticos
+            print(f"[DEBUG] Nombres únicos en archivo: {df['Players'].unique() if 'Players' in df.columns else 'No hay columna Players'}")
+            
             # 3. Extraer información de Sessions
             if "Sessions" in df.columns:
                 session_info = self._derivar_rival_y_local(df["Sessions"])
                 df["Rival"] = session_info["Rival_from_sess"]
                 df["Local_Visitante"] = session_info["Local_Visitante_from_sess"]
 
+            # 4. Aplicar aliases y verificar - CORREGIDO
+            df = self._aplicar_alias_jugadores(df)
 
-            # 3.1 aplicar alias y normalizar rival (canónico)
+            print(f"[DEBUG] Columnas después de aplicar aliases: {list(df.columns)}")
+            if 'id_jugador' in df.columns:
+                print(f"[DEBUG] IDs mapeados: {df['id_jugador'].notna().sum()} de {len(df)}")
+                print(f"[DEBUG] Ejemplos de IDs: {df['id_jugador'].head(5).tolist()}")
+            else:
+                print("[DEBUG] Columna id_jugador no existe después de aliases")
+            
+            # DEBUG CORREGIDO: Verificar si la columna id_jugador existe primero
+            if 'id_jugador' in df.columns:
+                no_mapeados = df[df['id_jugador'].isna()]['Players' if 'Players' in df.columns else 'Nombre'].unique()
+                if len(no_mapeados) > 0:
+                    print(f"[DEBUG] Jugadores sin ID después de aliases: {no_mapeados}")
+            else:
+                print("[DEBUG] Columna id_jugador no existe aún después de aplicar aliases")
+                
+            # 5. aplicar alias y normalizar rival (canónico)
             aliases_map = self._get_aliases_rivales_map()
             df["Rival_original"] = df["Rival"]
 
@@ -2063,10 +2509,10 @@ class ETLChivas:
             df["_R_norm"] = df["_R_norm"].apply(lambda r: aliases_map.get(r, r))
             df["Rival"] = df["_R_norm"]
 
-            # 3.2 asignar id_rival usando lookup/alta por nombre normalizado
+            # 6. asignar id_rival usando lookup/alta por nombre normalizado
             df["id_rival"] = df["Rival"].apply(self._obtener_o_crear_id_rival)
-                
-            # 4. Inferir Fecha por join (Rival + L/V) con fallback por Rival único
+                    
+            # 7. Inferir Fecha por join (Rival + L/V) con fallback por Rival único
             if hasattr(self, "_calendario_partidos_df") and not self._calendario_partidos_df.empty:
                 cal = self._calendario_partidos_df.copy()
 
@@ -2110,20 +2556,16 @@ class ETLChivas:
                     ej = (sin_fecha.get("Rival_original", sin_fecha["Rival"])
                         .dropna().astype(str).head(10).tolist())
                     print(f"[WARN] {len(sin_fecha)} partidos sin fecha (revisar calendario/aliases). Ejemplos: {ej}")
-            else:
-                df["Fecha"] = pd.NaT
 
-
-            
-            # 5. Validar que tenemos fechas
+            # 8. Validar que tenemos fechas
             if "Fecha" not in df.columns or df["Fecha"].isna().all():
                 raise ValueError("No se pudieron obtener fechas para los partidos")
             
-            # 6. Filtrar partidos con fecha válida
+            # 9. Filtrar partidos con fecha válida
             df = df.dropna(subset=["Fecha"])
             print(f"[DEBUG] Partidos con fecha válida: {len(df)}")
             
-            # 7) Mapeo de columnas (robusto)
+            # 10. Mapeo de columnas (robusto)
             column_map = {
                 # nombre del jugador
                 "Players": "Nombre", "Player": "Nombre", "Jugador": "Nombre",
@@ -2169,14 +2611,14 @@ class ETLChivas:
             }
             df = df.rename(columns=column_map)  # errors='ignore' implícito
 
-            # 8) Asignar IDs de jugadores y aplicar aliases
+            # 11. Asignar IDs de jugadores y aplicar aliases
             df = self._anexar_id_jugador_por_nombre(df)
             df = self._aplicar_alias_jugadores(df)
 
-            # 9) (ya tenés id_rival de 3.2). Si tu _adjuntar_id_rival pisa valores, omitirlo:
+            # 12. (ya tenés id_rival de 3.2). Si tu _adjuntar_id_rival pisa valores, omitirlo:
             # df = self._adjuntar_id_rival(df)   # <- evítalo si ya seteaste df["id_rival"]
 
-            # 10) Tipar a numérico (maneja coma decimal, strings, etc.)
+            # 13. Tipar a numérico (maneja coma decimal, strings, etc.)
             cols_num = [
                 "Distancia_total","HSR_abs_m","HMLD_m","Sprints_distancia_m","Sprints_cantidad",
                 "Sprints_vel_max_kmh","Acc_3","Dec_3","Player_Load","HSR_rel_m",
@@ -2184,52 +2626,46 @@ class ETLChivas:
             ]
             df = self._a_numerico(df, columnas=cols_num)
 
-            # 11) Corregir Local/Visitante con calendario si corresponde
+            # 14. Corregir Local/Visitante con calendario si corresponde
             df_valido = df.dropna(subset=["id_jugador","Fecha"]).copy()
             if hasattr(self, "_calendario_partidos_df") and not df_valido.empty:
                 df_valido = self.corregir_local_visitante(df_valido, self._calendario_partidos_df)
 
-            # 12) Calcular CE/CS/CR y Rendimiento_Partido (si falta)
+            # 15. Calcular CE/CS/CR e híbridos
             df_valido = self._calcular_ce_cs_cr(df_valido)
-            if ("Rendimiento_Partido" not in df_valido.columns) or df_valido["Rendimiento_Partido"].isna().all():
-                df_valido = self._calcular_rendimiento_total(df_valido, destino_col="Rendimiento_Partido")
+            df_valido = self._calcular_rendimiento_partido_hibrido(df_valido)
 
-            # 12.b) NUEVO: calcular Rendimiento_vs_Entreno (%)
-            df_valido = self._agregar_rve(df_valido)
+            # 16. NUEVO: abrir UNA conexión y usarla para cálculos/UPSERT
+            with self._conectar() as conn:
+                # RvE clásico
+                df_valido = self._agregar_rve(df_valido)
 
-            # 13) Asegurar columnas para UPSERT (sin warnings)
-            cols_partidos = [
-                "id_jugador","Fecha","id_rival","Rival","Local_Visitante","Duracion_min",
-                "Distancia_total","HSR_abs_m","HMLD_m",
-                "Sprints_distancia_m","Sprints_cantidad","Sprints_vel_max_kmh",
-                "Acc_3","Dec_3","Player_Load",
-                "Carga_Explosiva","Carga_Sostenida","Carga_Regenerativa",
-                "Rendimiento_Partido","Rendimiento_vs_Entreno",   
-                "HSR_rel_m","Velocidad_prom_m_min"
-            ]
-            df_valido = df_valido.reindex(columns=cols_partidos, fill_value=None)
+                # RvE basado en intensidad usando la MISMA conexión
+                df_valido = self._agregar_rve_intensidad(df_valido, conn)
 
-            # 14) Un (1) UPSERT y listo
-            n = self.upsert_partidos(df_valido)
-            print(f"[SUCCESS] Partidos cargados: {n}")
+                # 17. Asegurar columnas para UPSERT
+                cols_partidos = [
+                    "id_jugador","Fecha","id_rival","Rival","Local_Visitante","Duracion_min",
+                    "Distancia_total","HSR_abs_m","HMLD_m",
+                    "Sprints_distancia_m","Sprints_cantidad","Sprints_vel_max_kmh",
+                    "Acc_3","Dec_3","Player_Load",
+                    "Carga_Explosiva","Carga_Sostenida","Carga_Regenerativa",
+                    "Rendimiento_Partido","Rendimiento_Intensidad","RvE_Intensidad",
+                    "HSR_rel_m","Velocidad_prom_m_min"
+                ]
+                df_valido = df_valido.reindex(columns=cols_partidos, fill_value=None)
 
-            # Fecha de referencia para el nombre; si hay varias, uso la mínima
-            try:
-                fecha_ref = None
-                if "Fecha" in df_valido.columns and not df_valido["Fecha"].isna().all():
-                    fmin = pd.to_datetime(df_valido["Fecha"], errors="coerce").dropna()
-                    if not fmin.empty:
-                        fecha_ref = fmin.min().date().isoformat()
-            except Exception:
-                fecha_ref = None
+                # 18. UPSERT dentro del contexto de la conexión
+                n = self.upsert_partidos(df_valido, conn=conn)  # 🔥 Pasar la conexión activa
 
-            # Archivar sólo si cargamos al menos un partido
+            # Mover el archivado FUERA del bloque with
             if n and n > 0:
+                fecha_ref = pd.to_datetime(df_valido['Fecha'].iloc[0]).date().isoformat() if not df_valido.empty else None
                 self._archivar_archivo(ruta_excel, "partidos", fecha_ref)
 
             return n
 
-            
+                
         except Exception as e:
             print(f"[ERROR] Fallo al cargar partidos: {str(e)}")
             import traceback
@@ -2239,19 +2675,41 @@ class ETLChivas:
     def procesar_carpeta_partidos(self, dir_partidos: Path) -> int:
         dir_partidos = Path(dir_partidos)
         n_total = 0
+        fmin_glob, fmax_glob = None, None
+        ids_glob = set()
 
-        # ⬇️ Barrer .xlsx y .xls
         archivos = []
         for patron in ("*.xlsx", "*.xls"):
             archivos.extend(sorted(dir_partidos.glob(patron)))
 
+        # Procesar todos los archivos primero
         for archivo in archivos:
             if archivo.name.startswith("~$"):
                 continue
             try:
-                n_total += self.cargar_partidos_desde_master(archivo)
+                n = self.cargar_partidos_desde_master(archivo)
+                n_total += n
             except Exception as e:
                 print(f"[ERROR] Falló {archivo.name}: {e}")
+        
+        # Luego actualizar sobrecargas UNA SOLA VEZ
+        try:
+            with self._conectar() as conn:
+                df_range = pd.read_sql(
+                    "SELECT MIN(Fecha) AS fmin, MAX(Fecha) AS fmax FROM DB_Partidos",
+                    conn
+                )
+            fmin_glob = df_range['fmin'][0]
+            fmax_glob = df_range['fmax'][0]
+            
+            self._actualizar_sobrecargas(
+                jugadores=None,
+                fecha_desde=fmin_glob, 
+                fecha_hasta=fmax_glob
+            )
+        except Exception as e:
+            print(f"[WARN] No se pudieron recalcular sobrecargas: {e}")
+        
         return n_total
 
 

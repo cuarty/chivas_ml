@@ -4,10 +4,12 @@ from src.chivas_ml.etl.pipeline import ETLChivas
 import pandas as pd
 import sqlite3
 import warnings
+import time
 
 # Configuración de warnings
 warnings.filterwarnings('ignore', category=FutureWarning)
 pd.set_option('future.no_silent_downcasting', True)
+
 
 def configurar_rutas():
     """Configura todas las rutas necesarias"""
@@ -39,7 +41,6 @@ def inicializar_etl(rutas):
     return ETLChivas(ruta_sqlite=rutas['DB_PATH'], calendario_partidos_xlsx=calendario)
 
 
-
 def cargar_jugadores(etl, jugadores_xlsx):
     """Carga los jugadores en la base de datos con verificación"""
     if not jugadores_xlsx.exists():
@@ -55,8 +56,16 @@ def cargar_jugadores(etl, jugadores_xlsx):
         jugadores = pd.read_sql("SELECT id_jugador, Nombre FROM DB_Jugadores", conn)
         print(f"\n[DEBUG] Total jugadores en DB: {len(jugadores)}")
         print("Ejemplos:", jugadores.head(5).to_dict('records'))
+
+    # Debug: Ver todos los jugadores en DB
+    with etl._conectar() as conn:
+        todos_jugadores = pd.read_sql("SELECT id_jugador, Nombre FROM DB_Jugadores ORDER BY id_jugador", conn)
+        print("\n[DEBUG] Todos los jugadores en DB:")
+        print(todos_jugadores.to_string(index=False))
     
     return True
+
+
 
 def procesar_entrenamientos(etl, raw_dir):
     """Procesa todos los archivos de entrenamiento"""
@@ -67,6 +76,7 @@ def procesar_entrenamientos(etl, raw_dir):
     print("\n[INFO] Procesando entrenamientos...")
     return etl.procesar_carpeta(raw_dir)
 
+
 def procesar_partidos(etl, partidos_master):
     """Procesa el archivo maestro de partidos"""
     if not partidos_master.exists():
@@ -75,6 +85,7 @@ def procesar_partidos(etl, partidos_master):
     
     print("\n[INFO] Procesando partidos desde archivo maestro...")
     return etl.cargar_partidos_desde_master(partidos_master)
+
 
 def mostrar_encabezados(dir_entrenos, dir_partidos):
     def _dump(d, titulo):
@@ -113,59 +124,82 @@ def procesar_partidos_dir(etl, dir_partidos: Path):
 
 
 def main():
+    # Limpiar conexiones previas
+    db_path = Path("data/external/chivas_dw.sqlite")
+    if db_path.exists():
+        try:
+            # Cerrar todas las conexiones
+            conn = sqlite3.connect(str(db_path))
+            conn.execute("PRAGMA optimize")
+            conn.close()
+            time.sleep(1)
+        except:
+            pass
+
     # 1. Configuración inicial
     rutas = configurar_rutas()
     etl = inicializar_etl(rutas)
     
     # 2. Mostrar estructura de archivos (debug)
     mostrar_encabezados(rutas['RAW_ENTRENAMIENTOS'], rutas['RAW_PARTIDOS'])
-
-
-    # En main.py, antes de procesar partidos:
+    
+    # 3. Cargar calendario de partidos PRIMERO
     etl.cargar_calendario_partidos(rutas['CAL_PARTIDOS'])
-
-
-    # 3. Cargar jugadores (verificación exhaustiva)
+    
+    # 4. Cargar jugadores (verificación exhaustiva)
     if not cargar_jugadores(etl, rutas['JUGADORES_XLSX']):
         return  # Terminar si no hay jugadores
-
-    # En main.py, antes de procesar
+    
+    # 5. Validar aliases
     etl.validar_aliases()
-
-
-    # 3.1 Cargar lesiones de jugadores
-
+    
+    # 6. Cargar lesiones de jugadores (si existen)
     ruta_lesiones = Path("data/raw/lesiones/lesiones_musculares.xlsx")
     if ruta_lesiones.exists():
         n = etl.cargar_lesiones_desde_excel(ruta_lesiones)
         print(f"[OK] Lesiones cargadas/actualizadas: {n}")
-
     
-    # 4. ENTRENAMIENTOS (carpeta)
+    # 7. PROCESAR ENTRENAMIENTOS
     resultado_entrenos = procesar_entrenamientos_dir(etl, rutas['RAW_ENTRENAMIENTOS'])
     print(f"\n[RESUMEN] Entrenamientos procesados: {resultado_entrenos['entrenamientos']}")
     print(f"[RESUMEN] Semanal actualizado: {resultado_entrenos['filas_rendimiento_semanal']}")
-
-    # 5. PARTIDOS (carpeta)
+    
+    # 8. PROCESAR PARTIDOS
     n_partidos = procesar_partidos_dir(etl, rutas['RAW_PARTIDOS'])
     print(f"\n[RESUMEN] Partidos actualizados (carpeta): {n_partidos}")
-
-    # (opcional, soporte legacy si seguís usando un master único además de la carpeta)
+    
+    # 9. Procesar archivo maestro legacy (si existe)
     if rutas['PARTIDOS_MASTER'].exists():
         print("\n[INFO] Procesando PARTIDOS desde master legacy…")
         n_partidos += procesar_partidos(etl, rutas['PARTIDOS_MASTER'])
         print(f"[RESUMEN] Partidos total (carpeta + master): {n_partidos}")
-
     
+    # 10. CONSOLIDAR DATOS (con manejo de errores mejorado)
+    try:
+        print("Intentando consolidar rivales...")
+        
+        # Forzar cierre de todas las conexiones previas
+        import gc
+        gc.collect()
+        time.sleep(2)
+        
+        etl.consolidar_rivales()
+        etl.estandarizar_rival_display_mayusculas()
+        print("Consolidación completada exitosamente")
+        
+    except sqlite3.OperationalError as e:
+        if "locked" in str(e).lower():
+            print("[WARN] Base de datos bloqueada, omitiendo consolidación...")
+            # Continuar sin consolidación
+        else:
+            print(f"[ERROR] Error de base de datos: {e}")
+    except Exception as e:
+        print(f"[ERROR] Error inesperado durante consolidación: {e}")
 
-    # En main.py, antes de procesar
+    # 11. Validar aliases nuevamente después de procesar todo
     etl.validar_aliases()
-
-    etl.consolidar_rivales()                  # fusiona duplicados
-    etl.estandarizar_rival_display_mayusculas()  # pone MAYÚSCULAS en DB_Partidos
-
     
-    # 6. Resumen final
+    # 12. Resumen final
     with etl._conectar() as conn:
         resumen = {
             'Jugadores': pd.read_sql("SELECT COUNT(*) FROM DB_Jugadores", conn).iloc[0,0],
@@ -175,7 +209,8 @@ def main():
         print("\n[RESUMEN FINAL]")
         for k, v in resumen.items():
             print(f"{k}: {v}")
-
+    
+    # 13. Debug info
     with etl._conectar() as conn:
         print("\n[DEBUG] Resumen de entrenamientos cargados:")
         resumen_entrenos = pd.read_sql("""
@@ -187,7 +222,7 @@ def main():
         FROM DB_Entrenamientos
         """, conn)
         print(resumen_entrenos)
-
+        
         print("\n[DEBUG] Jugadores sin entrenamientos:")
         jugadores_sin_entrenos = pd.read_sql("""
         SELECT j.id_jugador, j.Nombre 
@@ -196,6 +231,15 @@ def main():
         WHERE e.id_entrenamiento IS NULL
         """, conn)
         print(jugadores_sin_entrenos)
+    
+    # Debug adicional para partidos
+    with etl._conectar() as conn:
+        partidos_debug = pd.read_sql("SELECT * FROM DB_Partidos LIMIT 5", conn)
+        print("\n[DEBUG] Primeros 5 partidos en DB:")
+        print(partidos_debug)
+        
+        count_partidos = pd.read_sql("SELECT COUNT(*) as total_partidos FROM DB_Partidos", conn)
+        print(f"\n[DEBUG] Total de partidos en DB: {count_partidos.iloc[0,0]}")
 
 if __name__ == "__main__":
     main()
