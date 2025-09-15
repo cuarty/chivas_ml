@@ -1992,152 +1992,192 @@ class ETLChivas:
         return len(sem)
 
 
+    def _actualizar_sobrecargas(
+        self,
+        jugadores=None,
+        fecha_desde=None,
+        fecha_hasta=None,
+        min_sesiones_28d: int = 8
+    ) -> None:
+        import pandas as pd
+        import numpy as np
+        from datetime import timedelta
 
-    def _actualizar_sobrecargas(self, jugadores=None, fecha_desde=None, fecha_hasta=None) -> None:
-        import time, sqlite3
+        with self._conectar() as conn:
+            # --- Partidos a recalcular
+            conds, params = [], []
+            if jugadores:
+                marks = ",".join("?" for _ in jugadores)
+                conds.append(f"p.id_jugador IN ({marks})")
+                params.extend(list(map(int, jugadores)))
+            if fecha_desde:
+                conds.append("date(p.Fecha) >= ?"); params.append(fecha_desde)
+            if fecha_hasta:
+                conds.append("date(p.Fecha) <= ?"); params.append(fecha_hasta)
+            where = "WHERE " + " AND ".join(conds) if conds else ""
 
-        where, params = [], []
+            dfp = pd.read_sql(
+                f"""SELECT p.id_partido, p.id_jugador, date(p.Fecha) AS Fecha,
+                        COALESCE(p.Carga_Explosiva,0.0) AS CE_part,
+                        COALESCE(p.Carga_Sostenida,0.0) AS CS_part,
+                        COALESCE(p.Carga_Regenerativa,0.0) AS CR_part
+                    FROM DB_Partidos p
+                    {where}""",
+                conn, params=params
+            )
+            if dfp.empty: 
+                return
 
-        if jugadores:
-            marca = ",".join("?" for _ in jugadores)
-            where.append(f"p.id_jugador IN ({marca})")
-            params.extend(list(map(int, jugadores)))
+            # --- Entrenos (para todos los jugadores y rango extendido)
+            fmin = pd.to_datetime(dfp["Fecha"]).min().date()
+            fmax = pd.to_datetime(dfp["Fecha"]).max().date()
+            fmin_q = (fmin - timedelta(days=28)).isoformat()
+            fmax_q = (fmax).isoformat()  # llegamos hasta el día del partido por si hay entreno ese mismo día
 
-        if fecha_desde:
-            where.append("date(p.Fecha) >= ?"); params.append(fecha_desde)
-        if fecha_hasta:
-            where.append("date(p.Fecha) <= ?"); params.append(fecha_hasta)
+            marks_j = ",".join("?" for _ in dfp["id_jugador"].unique())
+            params_ent = list(map(int, dfp["id_jugador"].unique())) + [fmin_q, fmax_q]
 
-        filtro = ("WHERE " + " AND ".join(where)) if where else ""
+            dfe = pd.read_sql(
+                f"""SELECT id_jugador,
+                        date(Fecha) AS Fecha,
+                        COALESCE(Carga_Explosiva,0.0) AS CE,
+                        COALESCE(Carga_Sostenida,0.0) AS CS,
+                        COALESCE(Carga_Regenerativa,0.0) AS CR
+                    FROM DB_Entrenamientos
+                    WHERE id_jugador IN ({marks_j})
+                    AND date(Fecha) >= ?
+                    AND date(Fecha) <= ?""",
+                conn, params=params_ent
+            )
 
-        sqls = [
-            # --- CE_prev7d
-            f"""UPDATE DB_Partidos AS p
-                SET CE_prev7d = (
-                    SELECT COALESCE(SUM(e.Carga_Explosiva),0)
-                    FROM DB_Entrenamientos e
-                    WHERE e.id_jugador = p.id_jugador
-                    AND e.Fecha >= date(p.Fecha,'-7 day')
-                    AND e.Fecha  <  date(p.Fecha)
-                )
-                {filtro};""",
+            # --- Partidos anteriores (para baseline 28d)
+            #    Traemos cargas de partidos (si existen esas columnas) para los 28d previos
+            dfp_hist = pd.read_sql(
+                f"""SELECT id_jugador,
+                        date(Fecha) AS Fecha,
+                        COALESCE(Carga_Explosiva,0.0) AS CEp,
+                        COALESCE(Carga_Sostenida,0.0) AS CSp,
+                        COALESCE(Carga_Regenerativa,0.0) AS CRp
+                    FROM DB_Partidos
+                    WHERE id_jugador IN ({marks_j})
+                    AND date(Fecha) >= ?
+                    AND date(Fecha) <= ?""",
+                conn, params=[*map(int, dfp["id_jugador"].unique()), fmin_q, fmax_q]
+            )
 
-            # --- CS_prev7d
-            f"""UPDATE DB_Partidos AS p
-                SET CS_prev7d = (
-                    SELECT COALESCE(SUM(e.Carga_Sostenida),0)
-                    FROM DB_Entrenamientos e
-                    WHERE e.id_jugador = p.id_jugador
-                    AND e.Fecha >= date(p.Fecha,'-7 day')
-                    AND e.Fecha  <  date(p.Fecha)
-                )
-                {filtro};""",
+        # --- Preparar entrenos por día
+        ent = pd.DataFrame(columns=["id_jugador","Fecha","CE","CS","CR"])
+        if not dfe.empty:
+            dfe["Fecha"] = pd.to_datetime(dfe["Fecha"]).dt.date
+            ent = (dfe.groupby(["id_jugador","Fecha"], as_index=False)
+                    .agg(CE=("CE","sum"), CS=("CS","sum"), CR=("CR","sum")))
+            ent["CT_dia"] = ent[["CE","CS","CR"]].sum(axis=1)
 
-            # --- CR_prev7d
-            f"""UPDATE DB_Partidos AS p
-                SET CR_prev7d = (
-                    SELECT COALESCE(SUM(e.Carga_Regenerativa),0)
-                    FROM DB_Entrenamientos e
-                    WHERE e.id_jugador = p.id_jugador
-                    AND e.Fecha >= date(p.Fecha,'-7 day')
-                    AND e.Fecha  <  date(p.Fecha)
-                )
-                {filtro};""",
+        # --- Preparar partidos por día (para baseline; el día del partido actual se excluye más abajo)
+        part = pd.DataFrame(columns=["id_jugador","Fecha","CEp","CSp","CRp"])
+        if not dfp_hist.empty:
+            dfp_hist["Fecha"] = pd.to_datetime(dfp_hist["Fecha"]).dt.date
+            part = (dfp_hist.groupby(["id_jugador","Fecha"], as_index=False)
+                            .agg(CEp=("CEp","sum"), CSp=("CSp","sum"), CRp=("CRp","sum")))
+            part["CTp_dia"] = part[["CEp","CSp","CRp"]].sum(axis=1)
 
-            # --- CT_7d, CT_28d_avg, ACWR y ACWR_pct (0–100)
-            f"""UPDATE DB_Partidos AS p
-                SET
-                CT_7d = COALESCE(CE_prev7d,0)+COALESCE(CS_prev7d,0)+COALESCE(CR_prev7d,0),
-                CT_28d_avg = (
-                    SELECT CASE WHEN COUNT(*)=0 THEN NULL ELSE AVG(x.CT) END
-                    FROM (
-                    SELECT (COALESCE(e.Carga_Explosiva,0)+COALESCE(e.Carga_Sostenida,0)+COALESCE(e.Carga_Regenerativa,0)) AS CT
-                    FROM DB_Entrenamientos e
-                    WHERE e.id_jugador = p.id_jugador
-                        AND e.Fecha >= date(p.Fecha,'-28 day')
-                        AND e.Fecha  <  date(p.Fecha)
-                    ) x
-                ),
-                ACWR = CASE
-                        WHEN (
-                            SELECT COUNT(*)
-                            FROM DB_Entrenamientos e
-                            WHERE e.id_jugador = p.id_jugador
-                            AND e.Fecha >= date(p.Fecha,'-28 day')
-                            AND e.Fecha  <  date(p.Fecha)
-                        ) = 0
-                        THEN NULL
-                        ELSE (
-                            COALESCE(CE_prev7d,0)+COALESCE(CS_prev7d,0)+COALESCE(CR_prev7d,0)
-                        ) / (
-                            SELECT AVG(x.CT)
-                            FROM (
-                            SELECT (COALESCE(e.Carga_Explosiva,0)+COALESCE(e.Carga_Sostenida,0)+COALESCE(e.Carga_Regenerativa,0)) AS CT
-                            FROM DB_Entrenamientos e
-                            WHERE e.id_jugador = p.id_jugador
-                                AND e.Fecha >= date(p.Fecha,'-28 day')
-                                AND e.Fecha  <  date(p.Fecha)
-                            ) x
-                        )
-                        END,
-                ACWR_pct = CASE
-                            WHEN (
-                                SELECT COUNT(*)
-                                FROM DB_Entrenamientos e
-                                WHERE e.id_jugador = p.id_jugador
-                                AND e.Fecha >= date(p.Fecha,'-28 day')
-                                AND e.Fecha  <  date(p.Fecha)
-                            ) = 0
-                            THEN NULL
-                            ELSE 100.0 * (
-                                (
-                                COALESCE(CE_prev7d,0)+COALESCE(CS_prev7d,0)+COALESCE(CR_prev7d,0)
-                                ) / (
-                                SELECT AVG(x.CT)
-                                FROM (
-                                    SELECT (COALESCE(e.Carga_Explosiva,0)+COALESCE(e.Carga_Sostenida,0)+COALESCE(e.Carga_Regenerativa,0)) AS CT
-                                    FROM DB_Entrenamientos e
-                                    WHERE e.id_jugador = p.id_jugador
-                                    AND e.Fecha >= date(p.Fecha,'-28 day')
-                                    AND e.Fecha  <  date(p.Fecha)
-                                ) x
-                                )
-                            )
-                            END
-                {filtro};""",
+        # --- Index por jugador
+        ent_by_j = {jid: g.sort_values("Fecha") for jid, g in ent.groupby("id_jugador")}
+        par_by_j = {jid: g.sort_values("Fecha") for jid, g in part.groupby("id_jugador")}
 
-            # --- ACWR_flag (con alias también)
-            f"""UPDATE DB_Partidos AS p
-                SET ACWR_flag = CASE
-                    WHEN ACWR_pct IS NULL THEN 'Sin baseline'
-                    WHEN ACWR_pct < 80   THEN 'Baja'
-                    WHEN ACWR_pct <= 130 THEN 'Óptima'
-                    WHEN ACWR_pct <= 150 THEN 'Alta'
-                    ELSE 'Muy alta'
-                END
-                {filtro};"""
-        ]
+        # --- Loop partidos a actualizar
+        updates = []  # CE7,CS7,CR7,dias7,CT7,CT28avg,ACWR,ACWR_pct,ACWR_flag,ACWR_raw,id_partido
+
+        for row in dfp.itertuples(index=False):
+            pid = row.id_partido
+            jid = int(row.id_jugador)
+            fch = pd.to_datetime(row.Fecha).date()
+
+            g_ent = ent_by_j.get(jid, None)
+            g_par = par_by_j.get(jid, None)
+
+            # ---------- Ventana 7d INCLUYENDO día del partido ----------
+            f7_ini, f7_fin = fch - timedelta(days=6), fch  # [fch-6, fch]
+            win7 = pd.DataFrame(columns=["CE","CS","CR","CT_dia"])
+            if g_ent is not None:
+                m7 = (g_ent["Fecha"] >= f7_ini) & (g_ent["Fecha"] <= f7_fin)
+                win7 = g_ent.loc[m7].copy()
+
+            # Carga del partido ACTUAL (si la tenés)
+            CE_part = float(getattr(row, "CE_part", 0.0) or 0.0)
+            CS_part = float(getattr(row, "CS_part", 0.0) or 0.0)
+            CR_part = float(getattr(row, "CR_part", 0.0) or 0.0)
+            CT_part = CE_part + CS_part + CR_part
+
+            CE7  = float(win7["CE"].sum() if not win7.empty else 0.0) + CE_part
+            CS7  = float(win7["CS"].sum() if not win7.empty else 0.0) + CS_part
+            CR7  = float(win7["CR"].sum() if not win7.empty else 0.0) + CR_part
+            dias7 = (0 if win7.empty else int(len(win7))) + (1 if CT_part > 0 else 0)
+            CT7  = CE7 + CS7 + CR7
+
+            # ---------- Ventana 28d EXCLUYENDO el día del partido ----------
+            f28_ini, f28_fin = fch - timedelta(days=28), fch - timedelta(days=1)
+
+            # Entrenos en 28d
+            win28_ent = pd.DataFrame(columns=["CT_dia"])
+            if g_ent is not None:
+                me = (g_ent["Fecha"] >= f28_ini) & (g_ent["Fecha"] <= f28_fin)
+                win28_ent = g_ent.loc[me, ["Fecha","CT_dia"]]
+
+            # Partidos previos en 28d (excluye el actual por el fin = fch-1)
+            win28_par = pd.DataFrame(columns=["CTp_dia"])
+            if g_par is not None:
+                mp = (g_par["Fecha"] >= f28_ini) & (g_par["Fecha"] <= f28_fin)
+                win28_par = g_par.loc[mp, ["Fecha","CTp_dia"]]
+
+            # Merge por día: CT_total_dia = CT_entreno + CT_partido (si hubo partido ese día)
+            if not win28_ent.empty or not win28_par.empty:
+                w = (win28_ent.rename(columns={"CT_dia":"CT"})
+                            .merge(win28_par.rename(columns={"CTp_dia":"CT"}),
+                                    on="Fecha", how="outer", suffixes=("_e","_p")))
+                w["CT"] = w.get("CT_e", 0).fillna(0) + w.get("CT_p", 0).fillna(0)
+                dias_carga_28d = int((w["CT"] > 0).sum())
+                ct28_sum = float(w["CT"].sum())
+            else:
+                dias_carga_28d = 0
+                ct28_sum = 0.0
+
+            # Baseline semanal (sum/4.0) con mínimo de sesiones con carga
+            if dias_carga_28d >= min_sesiones_28d and ct28_sum > 0:
+                CT28avg = ct28_sum / 4.0  # promedio semanal crónico
+                acwr    = CT7 / CT28avg if CT28avg > 0 else None
+                acwrpct = 100.0 * acwr if acwr is not None else None
+                if acwr is None:
+                    flag = "Sin baseline"
+                elif acwr < 0.80:
+                    flag = "Baja"
+                elif acwr <= 1.30:
+                    flag = "Óptima"
+                elif acwr <= 1.50:
+                    flag = "Alta"
+                else:
+                    flag = "Muy alta"
+            else:
+                CT28avg = None
+                acwr = None
+                acwrpct = None
+                flag = "Sin baseline"
+
+            updates.append((CE7, CS7, CR7, dias7, CT7, CT28avg, acwr, acwrpct, flag, acwr, pid))
+
+        # --- Persistir
+        with self._conectar() as conn:
+            conn.executemany(
+                """UPDATE DB_Partidos
+                SET CE_prev7d=?, CS_prev7d=?, CR_prev7d=?, dias_entreno_prev7d=?,
+                    CT_7d=?, CT_28d_avg=?,
+                    ACWR=?, ACWR_pct=?, ACWR_flag=?, ACWR_raw=?
+                WHERE id_partido=?""",
+                updates
+            )
+            conn.commit()
 
 
-        for intento in range(3):  # Reintentar hasta 3 veces
-            try:
-                with self._conectar() as conn:
-                    cur = conn.cursor()
-                    for q in sqls:
-                        try:
-                            cur.execute(q, params)
-                        except sqlite3.OperationalError as e:
-                            if "locked" in str(e).lower() and intento < 4:
-                                time.sleep(0.5 * (intento + 1))  # Esperar progresivamente
-                                continue
-                            raise
-                    conn.commit()
-                break
-            except sqlite3.OperationalError as e:
-                if "locked" in str(e).lower() and intento < 4:
-                    time.sleep(1 * (intento + 1))
-                    continue
-                raise
 
 
 

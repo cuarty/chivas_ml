@@ -120,6 +120,26 @@ def procesar_partidos_dir(etl, dir_partidos: Path):
         if p.name.startswith('~$'):
             continue
         n_total += etl.cargar_partidos_desde_master(p)  # reutilizamos tu loader robusto
+    
+    # 👉 Recalcular sobrecargas para TODO el rango de partidos cargados
+    try:
+        with etl._conectar() as conn:
+            df_range = pd.read_sql(
+                "SELECT MIN(Fecha) AS fmin, MAX(Fecha) AS fmax FROM DB_Partidos",
+                conn
+            )
+        fmin_glob = df_range['fmin'][0]
+        fmax_glob = df_range['fmax'][0]
+        etl._actualizar_sobrecargas(
+            jugadores=None,
+            fecha_desde=fmin_glob,
+            fecha_hasta=fmax_glob
+        )
+        print("[OK] Sobrecargas/ACWR recalculadas tras cargar partidos")
+    except Exception as e:
+        print(f"[WARN] No se pudieron recalcular sobrecargas: {e}")
+
+
     return n_total
 
 
