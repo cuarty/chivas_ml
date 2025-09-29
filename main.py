@@ -139,6 +139,15 @@ def procesar_partidos_dir(etl, dir_partidos: Path):
     except Exception as e:
         print(f"[WARN] No se pudieron recalcular sobrecargas: {e}")
 
+    etl.actualizar_performance_partidos(fecha_desde=fmin_glob, fecha_hasta=fmax_glob, usar_acc3=True)
+
+    try:
+        etl.refrescar_tabla_grupal()
+        print("[OK] Tabla grupal lista para Power BI")
+    except Exception as e:
+        print(f"[WARN] No se pudo refrescar DB_Analisis_Grupal: {e}")
+
+
 
     return n_total
 

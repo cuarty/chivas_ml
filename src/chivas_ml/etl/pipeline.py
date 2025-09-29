@@ -324,6 +324,20 @@ class ETLChivas:
             add("ACWR_pct",              "REAL")
             add("ACWR_flag",             "TEXT")
 
+            # === NUEVAS PARA PERFORMANCE ===
+            add("Performance",            "REAL")    # % final 0..150
+            add("Perf_SinBaseline",       "INTEGER") # 0/1
+            add("P75_sdist",              "REAL")    # P75 final mezclado (jugador+equipo)
+            add("P75_hsr",                "REAL")
+            add("P75_dec3",               "REAL")
+            add("P75_acc3",               "REAL")
+
+            # guardar componentes por minuto (para debug/dash)
+            add("Perf_SprintsDist_xMin",  "REAL")
+            add("Perf_HSR_xMin",          "REAL")
+            add("Perf_Dec3_xMin",         "REAL")
+            add("Perf_Acc3_xMin",         "REAL")
+
 
             
             conn.commit()
@@ -1130,45 +1144,93 @@ class ETLChivas:
         return m
 
     def _aplicar_alias_jugadores(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Aplica aliases de manera robusta"""
+        """Aplica aliases con limpieza y fallback a un alias map automático (DB_Jugadores)."""
         if 'Nombre' not in df.columns and 'Players' in df.columns:
             df = df.rename(columns={'Players': 'Nombre'})
-        
         if 'Nombre' not in df.columns:
             return df
-            
-        # Cargar aliases
+
+        def norm_txt(s: str) -> str:
+            import unicodedata, re
+            s = str(s or "").strip()
+            s = s.strip("'").strip('"')          # quita comillas sueltas
+            s = s.lower()
+            s = ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
+            s = re.sub(r'\s+', ' ', s).strip()
+            return s
+
+        df = df.copy()
+        df['nombre_normalizado'] = df['Nombre'].map(norm_txt)
+
+        # 1) CSV de aliases (si existe)
         alias_path = Path("data/ref/aliases_jugadores.csv")
-        if not alias_path.exists():
-            print(f"[WARN] No existe archivo de aliases: {alias_path}")
-            return df
-            
-        try:
-            aliases = pd.read_csv(alias_path)
-            alias_dict = {}
-            
-            # Crear mapeo case-insensitive
-            for _, row in aliases.iterrows():
-                fuente = str(row['Nombre_Fuente']).strip().lower()
-                alias_dict[fuente] = row['id_jugador']
-                
-            # Aplicar aliases
-            df['nombre_normalizado'] = df['Nombre'].astype(str).str.strip().str.lower()
-            
-            # Crear columna id_jugador si no existe
-            if 'id_jugador' not in df.columns:
-                df['id_jugador'] = pd.NA
-                
-            # Mapear aliases
-            df['id_jugador'] = df['id_jugador'].fillna(
-                df['nombre_normalizado'].map(alias_dict)
-            )
-            
-            return df.drop(columns=['nombre_normalizado'], errors='ignore')
-            
-        except Exception as e:
-            print(f"[ERROR] Error aplicando aliases: {e}")
-            return df
+        alias_dict = {}
+        if alias_path.exists():
+            try:
+                aliases = pd.read_csv(alias_path)
+                for _, row in aliases.iterrows():
+                    fuente = norm_txt(row.get('Nombre_Fuente', ''))
+                    jid    = row.get('id_jugador', None)
+                    if fuente and pd.notna(jid):
+                        alias_dict[fuente] = int(jid)
+            except Exception as e:
+                print(f"[WARN] No pude leer aliases_jugadores.csv: {e}")
+
+        # 2) Alias automáticos fabricados desde DB_Jugadores (nombre completo, apellido, inicial+apellido, pegados, MAYUS)
+        auto = self._fabricar_alias_desde_db()  # ya normaliza y genera varias variantes
+        # además agregamos versiones “pegadas” tipo gsepulveda / daguirre / lromo
+        with self._conectar() as conn:
+            ref = pd.read_sql("SELECT id_jugador, Nombre FROM DB_Jugadores", conn)
+        import unicodedata, re
+        def make_variants(fullname: str, jid: int):
+            base = norm_txt(fullname)
+            toks = base.split()
+            if not toks:
+                return {}
+            nombre = toks[0]
+            apellido = toks[-1]
+            variants = {
+                apellido: jid,
+                apellido.upper(): jid,                  # 'ALVARADO'
+                f"{nombre} {apellido}": jid,           # 'alan mozo'
+                f"{nombre[:1]} {apellido}": jid,       # 'a mozo'
+                f"{nombre[:1]}{apellido}": jid,        # 'amozo'
+            }
+            # apellido pegado con inicial del nombre (lo que ves en Excel): 'gsepulveda', 'daguirre', 'lromo'
+            variants[f"{nombre[:1]}{apellido}"] = jid
+            return {k: v for k, v in variants.items() if k}
+
+        for _, r in ref.iterrows():
+            for k, v in make_variants(r['Nombre'], int(r['id_jugador'])).items():
+                if k not in auto:
+                    auto[k] = v
+
+        # 3) Aplicar: primero CSV, luego automáticos; si falta, fuzzy como último recurso
+        if 'id_jugador' not in df.columns:
+            df['id_jugador'] = pd.NA
+
+        df['id_jugador'] = df['id_jugador'].fillna(df['nombre_normalizado'].map(alias_dict))
+        falt = df['id_jugador'].isna()
+        if falt.any():
+            df.loc[falt, 'id_jugador'] = df.loc[falt, 'nombre_normalizado'].map(auto)
+
+        # 4) Fuzzy final (umbral alto para evitar falsos positivos)
+        falt = df['id_jugador'].isna()
+        if falt.any():
+            try:
+                df.loc[falt, 'id_jugador'] = self._resolver_id_por_alias_heuristico(
+                    df.loc[falt, 'Nombre']
+                )
+            except Exception as e:
+                print(f"[WARN] Fuzzy alias falló: {e}")
+
+        # Log de diagnostic
+        no_map = df[df['id_jugador'].isna()]['Nombre'].unique()
+        if len(no_map) > 0:
+            print(f"[WARN] No mapeados ({len(no_map)}): {no_map[:15]}...")
+
+        return df.drop(columns=['nombre_normalizado'], errors='ignore')
+
 
     def _fabricar_alias_desde_db(self) -> dict[str, int]:
         """Versión mejorada que maneja mejor los apellidos solos"""
@@ -1991,7 +2053,6 @@ class ETLChivas:
             conn.executemany(sql, data)
         return len(sem)
 
-
     def _actualizar_sobrecargas(
         self,
         jugadores=None,
@@ -2000,10 +2061,26 @@ class ETLChivas:
         min_sesiones_28d: int = 8
     ) -> None:
         import pandas as pd
-        import numpy as np
         from datetime import timedelta
 
+        # --- helper: asegurar columnas nuevas si no existen
+        def _ensure_cols(conn):
+            cols = pd.read_sql("PRAGMA table_info(DB_Partidos)", conn)["name"].tolist()
+            to_add = []
+            for name, dtype in [
+                ("CE_prev7d_pre", "REAL"), ("CS_prev7d_pre", "REAL"), ("CR_prev7d_pre", "REAL"),
+                ("dias_entreno_prev7d_pre", "INTEGER"), ("CT_7d_pre", "REAL"),
+            ]:
+                if name not in cols:
+                    to_add.append((name, dtype))
+            for name, dtype in to_add:
+                conn.execute(f"ALTER TABLE DB_Partidos ADD COLUMN {name} {dtype}")
+            if to_add:
+                conn.commit()
+
         with self._conectar() as conn:
+            _ensure_cols(conn)
+
             # --- Partidos a recalcular
             conds, params = [], []
             if jugadores:
@@ -2028,125 +2105,128 @@ class ETLChivas:
             if dfp.empty: 
                 return
 
-            # --- Entrenos (para todos los jugadores y rango extendido)
+            # --- Entrenos y partidos (para 28d y 7d)
             fmin = pd.to_datetime(dfp["Fecha"]).min().date()
             fmax = pd.to_datetime(dfp["Fecha"]).max().date()
             fmin_q = (fmin - timedelta(days=28)).isoformat()
-            fmax_q = (fmax).isoformat()  # llegamos hasta el día del partido por si hay entreno ese mismo día
+            fmax_q = fmax.isoformat()
 
             marks_j = ",".join("?" for _ in dfp["id_jugador"].unique())
             params_ent = list(map(int, dfp["id_jugador"].unique())) + [fmin_q, fmax_q]
 
             dfe = pd.read_sql(
-                f"""SELECT id_jugador,
-                        date(Fecha) AS Fecha,
+                f"""SELECT id_jugador, date(Fecha) AS Fecha,
                         COALESCE(Carga_Explosiva,0.0) AS CE,
                         COALESCE(Carga_Sostenida,0.0) AS CS,
                         COALESCE(Carga_Regenerativa,0.0) AS CR
                     FROM DB_Entrenamientos
                     WHERE id_jugador IN ({marks_j})
-                    AND date(Fecha) >= ?
-                    AND date(Fecha) <= ?""",
+                    AND date(Fecha) >= ? AND date(Fecha) <= ?""",
                 conn, params=params_ent
             )
 
-            # --- Partidos anteriores (para baseline 28d)
-            #    Traemos cargas de partidos (si existen esas columnas) para los 28d previos
             dfp_hist = pd.read_sql(
-                f"""SELECT id_jugador,
-                        date(Fecha) AS Fecha,
+                f"""SELECT id_jugador, date(Fecha) AS Fecha,
                         COALESCE(Carga_Explosiva,0.0) AS CEp,
                         COALESCE(Carga_Sostenida,0.0) AS CSp,
                         COALESCE(Carga_Regenerativa,0.0) AS CRp
                     FROM DB_Partidos
                     WHERE id_jugador IN ({marks_j})
-                    AND date(Fecha) >= ?
-                    AND date(Fecha) <= ?""",
+                    AND date(Fecha) >= ? AND date(Fecha) <= ?""",
                 conn, params=[*map(int, dfp["id_jugador"].unique()), fmin_q, fmax_q]
             )
 
-        # --- Preparar entrenos por día
-        ent = pd.DataFrame(columns=["id_jugador","Fecha","CE","CS","CR"])
-        if not dfe.empty:
-            dfe["Fecha"] = pd.to_datetime(dfe["Fecha"]).dt.date
-            ent = (dfe.groupby(["id_jugador","Fecha"], as_index=False)
-                    .agg(CE=("CE","sum"), CS=("CS","sum"), CR=("CR","sum")))
-            ent["CT_dia"] = ent[["CE","CS","CR"]].sum(axis=1)
+        # --- Agrupar por día
+        def group_ent(df):
+            if df.empty: 
+                return df
+            g = df.copy()
+            g["Fecha"] = pd.to_datetime(g["Fecha"]).dt.date
+            g = g.groupby(["id_jugador","Fecha"], as_index=False).agg(
+                CE=("CE","sum"), CS=("CS","sum"), CR=("CR","sum")
+            )
+            g["CT_dia"] = g["CE"] + g["CS"] + g["CR"]
+            return g
 
-        # --- Preparar partidos por día (para baseline; el día del partido actual se excluye más abajo)
-        part = pd.DataFrame(columns=["id_jugador","Fecha","CEp","CSp","CRp"])
-        if not dfp_hist.empty:
-            dfp_hist["Fecha"] = pd.to_datetime(dfp_hist["Fecha"]).dt.date
-            part = (dfp_hist.groupby(["id_jugador","Fecha"], as_index=False)
-                            .agg(CEp=("CEp","sum"), CSp=("CSp","sum"), CRp=("CRp","sum")))
-            part["CTp_dia"] = part[["CEp","CSp","CRp"]].sum(axis=1)
+        def group_par(df):
+            if df.empty:
+                return df
+            g = df.copy()
+            g["Fecha"] = pd.to_datetime(g["Fecha"]).dt.date
+            g = g.groupby(["id_jugador","Fecha"], as_index=False).agg(
+                CEp=("CEp","sum"), CSp=("CSp","sum"), CRp=("CRp","sum")
+            )
+            g["CTp_dia"] = g["CEp"] + g["CSp"] + g["CRp"]
+            return g
 
-        # --- Index por jugador
-        ent_by_j = {jid: g.sort_values("Fecha") for jid, g in ent.groupby("id_jugador")}
-        par_by_j = {jid: g.sort_values("Fecha") for jid, g in part.groupby("id_jugador")}
+        ent = group_ent(dfe)
+        par = group_par(dfp_hist)
+        ent_by = {k: v.sort_values("Fecha") for k, v in ent.groupby("id_jugador")}
+        par_by = {k: v.sort_values("Fecha") for k, v in par.groupby("id_jugador")}
 
-        # --- Loop partidos a actualizar
-        updates = []  # CE7,CS7,CR7,dias7,CT7,CT28avg,ACWR,ACWR_pct,ACWR_flag,ACWR_raw,id_partido
+        updates = []
 
         for row in dfp.itertuples(index=False):
             pid = row.id_partido
             jid = int(row.id_jugador)
             fch = pd.to_datetime(row.Fecha).date()
 
-            g_ent = ent_by_j.get(jid, None)
-            g_par = par_by_j.get(jid, None)
+            ge = ent_by.get(jid)  # entrenos por día
+            gp = par_by.get(jid)  # partidos por día
 
-            # ---------- Ventana 7d INCLUYENDO día del partido ----------
-            f7_ini, f7_fin = fch - timedelta(days=6), fch  # [fch-6, fch]
-            win7 = pd.DataFrame(columns=["CE","CS","CR","CT_dia"])
-            if g_ent is not None:
-                m7 = (g_ent["Fecha"] >= f7_ini) & (g_ent["Fecha"] <= f7_fin)
-                win7 = g_ent.loc[m7].copy()
+            # ---- Ventana PREVIA pura: [f-7, f-1]  (NO incluye match-day)
+            pre_ini, pre_fin = fch - timedelta(days=7), fch - timedelta(days=1)
+            win7e_pre = ge.loc[(ge["Fecha"] >= pre_ini) & (ge["Fecha"] <= pre_fin)] if ge is not None else None
+            win7p_pre = gp.loc[(gp["Fecha"] >= pre_ini) & (gp["Fecha"] <= pre_fin)] if gp is not None else None
 
-            # Carga del partido ACTUAL (si la tenés)
-            CE_part = float(getattr(row, "CE_part", 0.0) or 0.0)
-            CS_part = float(getattr(row, "CS_part", 0.0) or 0.0)
-            CR_part = float(getattr(row, "CR_part", 0.0) or 0.0)
-            CT_part = CE_part + CS_part + CR_part
+            CE7_pre = (0.0 if win7e_pre is None or win7e_pre.empty else float(win7e_pre["CE"].sum())) \
+                    + (0.0 if win7p_pre is None or win7p_pre.empty else float(win7p_pre["CEp"].sum()))
+            CS7_pre = (0.0 if win7e_pre is None or win7e_pre.empty else float(win7e_pre["CS"].sum())) \
+                    + (0.0 if win7p_pre is None or win7p_pre.empty else float(win7p_pre["CSp"].sum()))
+            CR7_pre = (0.0 if win7e_pre is None or win7e_pre.empty else float(win7e_pre["CR"].sum())) \
+                    + (0.0 if win7p_pre is None or win7p_pre.empty else float(win7p_pre["CRp"].sum()))
+            dias7_pre = len(pd.concat(
+                [win7e_pre[["Fecha"]] if win7e_pre is not None else pd.DataFrame(),
+                win7p_pre[["Fecha"]] if win7p_pre is not None else pd.DataFrame()]
+            ).drop_duplicates()) if (win7e_pre is not None or win7p_pre is not None) else 0
+            CT7_pre = CE7_pre + CS7_pre + CR7_pre
 
-            CE7  = float(win7["CE"].sum() if not win7.empty else 0.0) + CE_part
-            CS7  = float(win7["CS"].sum() if not win7.empty else 0.0) + CS_part
-            CR7  = float(win7["CR"].sum() if not win7.empty else 0.0) + CR_part
-            dias7 = (0 if win7.empty else int(len(win7))) + (1 if CT_part > 0 else 0)
-            CT7  = CE7 + CS7 + CR7
+            # ---- Ventana POST (aguda/ACWR): [f-6, f]  (INCLUYE match-day)
+            post_ini, post_fin = fch - timedelta(days=6), fch
+            win7e_post = ge.loc[(ge["Fecha"] >= post_ini) & (ge["Fecha"] <= post_fin)] if ge is not None else None
+            win7p_post = gp.loc[(gp["Fecha"] >= post_ini) & (gp["Fecha"] <= post_fin)] if gp is not None else None
 
-            # ---------- Ventana 28d EXCLUYENDO el día del partido ----------
+            CE7_post = (0.0 if win7e_post is None or win7e_post.empty else float(win7e_post["CE"].sum())) \
+                    + (0.0 if win7p_post is None or win7p_post.empty else float(win7p_post["CEp"].sum()))
+            CS7_post = (0.0 if win7e_post is None or win7e_post.empty else float(win7e_post["CS"].sum())) \
+                    + (0.0 if win7p_post is None or win7p_post.empty else float(win7p_post["CSp"].sum()))
+            CR7_post = (0.0 if win7e_post is None or win7e_post.empty else float(win7e_post["CR"].sum())) \
+                    + (0.0 if win7p_post is None or win7p_post.empty else float(win7p_post["CRp"].sum()))
+            dias7_post = len(pd.concat(
+                [win7e_post[["Fecha"]] if win7e_post is not None else pd.DataFrame(),
+                win7p_post[["Fecha"]] if win7p_post is not None else pd.DataFrame()]
+            ).drop_duplicates()) if (win7e_post is not None or win7p_post is not None) else 0
+            CT7_post = CE7_post + CS7_post + CR7_post
+
+            # ---- Baseline 28d (solo días con carga) para ACWR semanal (sum/4)
             f28_ini, f28_fin = fch - timedelta(days=28), fch - timedelta(days=1)
+            w28e = ge.loc[(ge["Fecha"] >= f28_ini) & (ge["Fecha"] <= f28_fin)][["Fecha","CT_dia"]] if ge is not None else None
+            w28p = gp.loc[(gp["Fecha"] >= f28_ini) & (gp["Fecha"] <= f28_fin)][["Fecha","CTp_dia"]] if gp is not None else None
 
-            # Entrenos en 28d
-            win28_ent = pd.DataFrame(columns=["CT_dia"])
-            if g_ent is not None:
-                me = (g_ent["Fecha"] >= f28_ini) & (g_ent["Fecha"] <= f28_fin)
-                win28_ent = g_ent.loc[me, ["Fecha","CT_dia"]]
-
-            # Partidos previos en 28d (excluye el actual por el fin = fch-1)
-            win28_par = pd.DataFrame(columns=["CTp_dia"])
-            if g_par is not None:
-                mp = (g_par["Fecha"] >= f28_ini) & (g_par["Fecha"] <= f28_fin)
-                win28_par = g_par.loc[mp, ["Fecha","CTp_dia"]]
-
-            # Merge por día: CT_total_dia = CT_entreno + CT_partido (si hubo partido ese día)
-            if not win28_ent.empty or not win28_par.empty:
-                w = (win28_ent.rename(columns={"CT_dia":"CT"})
-                            .merge(win28_par.rename(columns={"CTp_dia":"CT"}),
-                                    on="Fecha", how="outer", suffixes=("_e","_p")))
+            if (w28e is not None and not w28e.empty) or (w28p is not None and not w28p.empty):
+                w = (w28e.rename(columns={"CT_dia":"CT"}) if w28e is not None else pd.DataFrame(columns=["Fecha","CT"])) \
+                    .merge((w28p.rename(columns={"CTp_dia":"CT"}) if w28p is not None else pd.DataFrame(columns=["Fecha","CT"])),
+                        on="Fecha", how="outer", suffixes=("_e","_p"))
                 w["CT"] = w.get("CT_e", 0).fillna(0) + w.get("CT_p", 0).fillna(0)
                 dias_carga_28d = int((w["CT"] > 0).sum())
                 ct28_sum = float(w["CT"].sum())
             else:
-                dias_carga_28d = 0
-                ct28_sum = 0.0
+                dias_carga_28d, ct28_sum = 0, 0.0
 
-            # Baseline semanal (sum/4.0) con mínimo de sesiones con carga
             if dias_carga_28d >= min_sesiones_28d and ct28_sum > 0:
-                CT28avg = ct28_sum / 4.0  # promedio semanal crónico
-                acwr    = CT7 / CT28avg if CT28avg > 0 else None
-                acwrpct = 100.0 * acwr if acwr is not None else None
+                CT28avg = ct28_sum / 4.0
+                acwr = (CT7_post / CT28avg) if CT28avg > 0 else None
+                acwr_pct = (100.0 * acwr) if acwr is not None else None
                 if acwr is None:
                     flag = "Sin baseline"
                 elif acwr < 0.80:
@@ -2158,26 +2238,382 @@ class ETLChivas:
                 else:
                     flag = "Muy alta"
             else:
-                CT28avg = None
-                acwr = None
-                acwrpct = None
-                flag = "Sin baseline"
+                CT28avg, acwr, acwr_pct, flag = None, None, None, "Sin baseline"
 
-            updates.append((CE7, CS7, CR7, dias7, CT7, CT28avg, acwr, acwrpct, flag, acwr, pid))
+            updates.append((
+                # previas (sin partido)
+                CE7_pre, CS7_pre, CR7_pre, dias7_pre, CT7_pre,
+                # post/ACWR (incluye partido)
+                CE7_post, CS7_post, CR7_post, dias7_post, CT7_post,
+                CT28avg, acwr, acwr_pct, acwr, flag,
+                pid
+            ))
 
         # --- Persistir
         with self._conectar() as conn:
             conn.executemany(
                 """UPDATE DB_Partidos
-                SET CE_prev7d=?, CS_prev7d=?, CR_prev7d=?, dias_entreno_prev7d=?,
-                    CT_7d=?, CT_28d_avg=?,
-                    ACWR=?, ACWR_pct=?, ACWR_flag=?, ACWR_raw=?
+                SET
+                    CE_prev7d_pre=?, CS_prev7d_pre=?, CR_prev7d_pre=?, dias_entreno_prev7d_pre=?, CT_7d_pre=?,
+                    CE_prev7d=?, CS_prev7d=?, CR_prev7d=?, dias_entreno_prev7d=?, CT_7d=?,
+                    CT_28d_avg=?, ACWR=?, ACWR_pct=?, ACWR_raw=?, ACWR_flag=?
                 WHERE id_partido=?""",
                 updates
             )
             conn.commit()
 
+    def refrescar_tabla_grupal(self, tabla_destino: str = "DB_Analisis_Grupal") -> None:
+        """
+        Crea/refresca una tabla agregada por partido con dos scopes:
+        - EQUIPO: todos los jugadores que JUGARON (>0 minutos) en ese partido
+        - LINEA: solo los jugadores de cada línea que JUGARON en ese partido
 
+        Métricas por (Fecha, id_rival, Rival, [Linea]):
+        Jugadores_Participantes, Rendimiento_Promedio, ACWR_Promedio,
+        CE_prev7d_pre_total, CS_prev7d_pre_total, CR_prev7d_pre_total,
+        CT_7d_pre_total, CT_7d_post_total
+        """
+        import pandas as pd
+
+        with self._conectar() as conn:
+            cols = pd.read_sql("PRAGMA table_info(DB_Partidos)", conn)["name"].tolist()
+
+            # 🔹 Minutos jugados (autodetección; tu DB tiene 'Duracion_min')
+            if "Duracion_min" in cols:
+                col_min = "Duracion_min"
+            elif "Duration_min" in cols:
+                col_min = "Duration_min"
+            elif "Minutos" in cols:
+                col_min = "Minutos"
+            elif "Minutos_Jugados" in cols:
+                col_min = "Minutos_Jugados"
+            else:
+                # último recurso: usa el nombre más probable (no romperá, pero no filtrará si no existe)
+                col_min = "Duracion_min"
+
+            # Rendimiento disponible
+            cand_rend = [c for c in ("Rendimiento", "Rendimiento_Partido", "Rendimiento_pct") if c in cols]
+            rend_expr = cand_rend[0] if cand_rend else None
+
+            sql = f"""
+            SELECT
+                p.id_jugador,
+                p.id_rival,
+                p.Rival,                          -- Rival directo
+                date(p.Fecha) AS Fecha,
+                COALESCE(p.{col_min}, 0) AS Minutos,
+                COALESCE(p.CE_prev7d_pre, 0.0) AS CE_prev7d_pre,
+                COALESCE(p.CS_prev7d_pre, 0.0) AS CS_prev7d_pre,
+                COALESCE(p.CR_prev7d_pre, 0.0) AS CR_prev7d_pre,
+                COALESCE(p.CT_7d_pre, 0.0)       AS CT_7d_pre,
+                COALESCE(p.CT_7d, 0.0)           AS CT_7d_post,
+                {("COALESCE(p." + rend_expr + ", NULL) AS Rendimiento") if rend_expr else "NULL AS Rendimiento"},
+                COALESCE(p.ACWR, NULL) AS ACWR,
+                j.Linea
+            FROM DB_Partidos p
+            LEFT JOIN DB_Jugadores j ON j.id_jugador = p.id_jugador
+            """
+            df = pd.read_sql(sql, conn)
+
+        # Si no hay datos, crear tabla vacía y salir
+        if df.empty:
+            with self._conectar() as conn:
+                conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS {tabla_destino} (
+                    scope TEXT, Linea TEXT, Fecha DATE,
+                    id_rival INTEGER, Rival TEXT,
+                    Jugadores_Participantes INTEGER,
+                    Rendimiento_Promedio REAL, ACWR_Promedio REAL,
+                    CE_prev7d_pre_total REAL, CS_prev7d_pre_total REAL, CR_prev7d_pre_total REAL,
+                    CT_7d_pre_total REAL, CT_7d_post_total REAL
+                )""")
+                conn.commit()
+            print(f"[INFO] {tabla_destino} creada (vacía).")
+            return
+
+        # Solo quienes JUGARON > 0 min
+        df_played = df[df["Minutos"] > 0].copy()
+
+        def _agg(g):
+            return pd.Series({
+                "Jugadores_Participantes": g["id_jugador"].nunique(),
+                "Rendimiento_Promedio":   g["Rendimiento"].mean(skipna=True),
+                "ACWR_Promedio":          g["ACWR"].mean(skipna=True),
+                "CE_prev7d_pre_total":    g["CE_prev7d_pre"].sum(),
+                "CS_prev7d_pre_total":    g["CS_prev7d_pre"].sum(),
+                "CR_prev7d_pre_total":    g["CR_prev7d_pre"].sum(),
+                "CT_7d_pre_total":        g["CT_7d_pre"].sum(),
+                "CT_7d_post_total":       g["CT_7d_post"].sum(),
+            })
+
+        # EQUIPO
+        grp_team = (df_played
+                    .groupby(["Fecha", "id_rival", "Rival"], as_index=False)
+                    .apply(_agg)
+                    .reset_index(drop=True))
+        grp_team.insert(0, "scope", "EQUIPO")
+        grp_team.insert(1, "Linea", None)
+
+        # LINEA
+        df_line = df_played[df_played["Linea"].notna()].copy()
+        grp_line = (df_line
+                    .groupby(["Fecha", "id_rival", "Rival", "Linea"], as_index=False)
+                    .apply(_agg)
+                    .reset_index(drop=True))
+        grp_line.insert(0, "scope", "LINEA")
+
+        out = pd.concat([grp_team, grp_line], ignore_index=True)
+
+        with self._conectar() as conn:
+            conn.execute(f"DROP TABLE IF EXISTS {tabla_destino}")
+            conn.execute(f"""
+                CREATE TABLE {tabla_destino} (
+                    scope TEXT, Linea TEXT, Fecha DATE,
+                    id_rival INTEGER, Rival TEXT,
+                    Jugadores_Participantes INTEGER,
+                    Rendimiento_Promedio REAL, ACWR_Promedio REAL,
+                    CE_prev7d_pre_total REAL, CS_prev7d_pre_total REAL, CR_prev7d_pre_total REAL,
+                    CT_7d_pre_total REAL, CT_7d_post_total REAL
+                )
+            """)
+            out.to_sql(tabla_destino, conn, if_exists="append", index=False)
+            conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{tabla_destino}_fecha ON {tabla_destino}(Fecha)")
+            conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{tabla_destino}_rival ON {tabla_destino}(id_rival)")
+            conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{tabla_destino}_scope_linea ON {tabla_destino}(scope, Linea)")
+            conn.commit()
+
+        print(f"[OK] {tabla_destino} refrescada: {len(out)} filas (equipo + líneas)")
+
+    def actualizar_performance_partidos(
+        self,
+        fecha_desde: Optional[str] = None,
+        fecha_hasta: Optional[str] = None,
+        usar_acc3: bool = True,
+        pesos: Optional[dict] = None,
+    ) -> int:
+        """
+        Calcula Performance (%) por partido y lo guarda en DB_Partidos.
+        - Por-minuto: Sprints_distancia_m, HSR_abs_m, Dec_3, (Acc_3 opcional)
+        - Baseline P75: mezcla jugador (últimos 60d -> historial) + grupo (línea/equipo) previos a la fecha
+        - Mezcla: peso_jugador = min(n_prev, 5); peso_equipo = 5
+        - Performance = 100 * min(score_raw, 1.5)  # cap 150%
+        - Si no hay baseline ni propio ni grupal -> Performance = 100; Perf_SinBaseline = 1
+
+        Devuelve: cantidad de filas actualizadas.
+        """
+        # Pesos de cada componente (si no se proveen)
+        if pesos is None:
+            pesos = {"sdist": 1.0, "hsr": 1.0, "dec3": 1.0, "acc3": 1.0}
+        if not usar_acc3:
+            pesos["acc3"] = 0.0
+
+        with self._conectar() as conn:
+            # rango
+            if not fecha_desde or not fecha_hasta:
+                row = conn.execute("SELECT MIN(Fecha), MAX(Fecha) FROM DB_Partidos").fetchone()
+                if not row or not row[0]:
+                    print("[WARN] No hay partidos para calcular Performance.")
+                    return 0
+                fecha_desde = fecha_desde or row[0]
+                fecha_hasta = fecha_hasta or row[1]
+
+            # columnas existentes
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(DB_Partidos)")}
+            def has(c): return c in cols
+
+            # SELECT: solo Duracion_min (tu DB la tiene)
+            q = """
+            SELECT id_partido, id_jugador, date(Fecha) AS Fecha,
+                COALESCE(Duracion_min, 0) AS Minutos_ref,
+                COALESCE(Sprints_distancia_m, 0) AS Sprints_distancia_m,
+                COALESCE(HSR_abs_m, 0)           AS HSR_abs_m,
+                COALESCE(Dec_3, 0)               AS Dec_3,
+                COALESCE(Acc_3, 0)               AS Acc_3
+            FROM DB_Partidos
+            WHERE date(Fecha) >= date(?) AND date(Fecha) <= date(?)
+            ORDER BY id_jugador, date(Fecha);
+            """
+            df = pd.read_sql(q, conn, params=[fecha_desde, fecha_hasta], parse_dates=["Fecha"])
+            df = df[df["Minutos_ref"] > 0].copy()
+            if df.empty:
+                print("[WARN] No hay partidos con minutos > 0.")
+                return 0
+
+            # línea por jugador para baseline grupal
+            df_lineas = pd.read_sql("SELECT id_jugador, Linea FROM DB_Jugadores", conn)
+            mapa_linea = dict(zip(df_lineas["id_jugador"], df_lineas["Linea"]))
+
+            # por minuto
+            df["pm_sdist"] = df["Sprints_distancia_m"] / df["Minutos_ref"]
+            df["pm_hsr"]   = df["HSR_abs_m"]           / df["Minutos_ref"]
+            df["pm_dec3"]  = df["Dec_3"]               / df["Minutos_ref"]
+            df["pm_acc3"]  = df["Acc_3"]               / df["Minutos_ref"]
+
+            def _p75(s):
+                s = pd.to_numeric(s, errors="coerce").dropna()
+                return float(np.percentile(s, 75)) if len(s) else None
+
+            def _hist_jid(jid, fch, dias=60):
+                sql = """
+                SELECT
+                COALESCE(Sprints_distancia_m,0)/NULLIF(COALESCE(Duracion_min,0),0) AS pm_sdist,
+                COALESCE(HSR_abs_m,0)          /NULLIF(COALESCE(Duracion_min,0),0) AS pm_hsr,
+                COALESCE(Dec_3,0)              /NULLIF(COALESCE(Duracion_min,0),0) AS pm_dec3,
+                COALESCE(Acc_3,0)              /NULLIF(COALESCE(Duracion_min,0),0) AS pm_acc3
+                FROM DB_Partidos
+                WHERE id_jugador = ?
+                AND date(Fecha) <  date(?)
+                AND date(Fecha) >= date(?, ?)
+                AND COALESCE(Duracion_min,0) > 0;
+                """
+                return pd.read_sql(sql, conn, params=[jid, fch, fch, f"-{int(dias)} day"])
+
+            def _hist_jid_all(jid, fch):
+                sql = """
+                SELECT
+                COALESCE(Sprints_distancia_m,0)/NULLIF(COALESCE(Duracion_min,0),0) AS pm_sdist,
+                COALESCE(HSR_abs_m,0)          /NULLIF(COALESCE(Duracion_min,0),0) AS pm_hsr,
+                COALESCE(Dec_3,0)              /NULLIF(COALESCE(Duracion_min,0),0) AS pm_dec3,
+                COALESCE(Acc_3,0)              /NULLIF(COALESCE(Duracion_min,0),0) AS pm_acc3
+                FROM DB_Partidos
+                WHERE id_jugador = ?
+                AND date(Fecha) < date(?)
+                AND COALESCE(Duracion_min,0) > 0;
+                """
+                return pd.read_sql(sql, conn, params=[jid, fch])
+
+            def _hist_grupo(linea, fch):
+                if linea:
+                    sql = """
+                    SELECT
+                    COALESCE(p.Sprints_distancia_m,0)/NULLIF(COALESCE(p.Duracion_min,0),0) AS pm_sdist,
+                    COALESCE(p.HSR_abs_m,0)          /NULLIF(COALESCE(p.Duracion_min,0),0) AS pm_hsr,
+                    COALESCE(p.Dec_3,0)              /NULLIF(COALESCE(p.Duracion_min,0),0) AS pm_dec3,
+                    COALESCE(p.Acc_3,0)              /NULLIF(COALESCE(p.Duracion_min,0),0) AS pm_acc3
+                    FROM DB_Partidos p
+                    JOIN DB_Jugadores j USING(id_jugador)
+                    WHERE date(p.Fecha) < date(?)
+                    AND COALESCE(p.Duracion_min,0) > 0
+                    AND j.Linea = ?;
+                    """
+                    return pd.read_sql(sql, conn, params=[fch, linea])
+                else:
+                    sql = """
+                    SELECT
+                    COALESCE(Sprints_distancia_m,0)/NULLIF(COALESCE(Duracion_min,0),0) AS pm_sdist,
+                    COALESCE(HSR_abs_m,0)          /NULLIF(COALESCE(Duracion_min,0),0) AS pm_hsr,
+                    COALESCE(Dec_3,0)              /NULLIF(COALESCE(Duracion_min,0),0) AS pm_dec3,
+                    COALESCE(Acc_3,0)              /NULLIF(COALESCE(Duracion_min,0),0) AS pm_acc3
+                    FROM DB_Partidos
+                    WHERE date(Fecha) < date(?)
+                    AND COALESCE(Duracion_min,0) > 0;
+                    """
+                    return pd.read_sql(sql, conn, params=[fch])
+
+            updates = []
+            for r in df.itertuples(index=False):
+                jid = int(r.id_jugador)
+                fch = r.Fecha.date().isoformat()
+                linea = mapa_linea.get(jid)
+
+                pm_s, pm_h, pm_d, pm_a = float(r.pm_sdist), float(r.pm_hsr), float(r.pm_dec3), float(r.pm_acc3)
+
+                hj = _hist_jid(jid, fch, 60)
+                n_j = len(hj) or len(_hist_jid_all(jid, fch))
+                if len(hj) == 0:
+                    hj = _hist_jid_all(jid, fch)
+
+                p75j_s = _p75(hj["pm_sdist"]) if n_j else None
+                p75j_h = _p75(hj["pm_hsr"])   if n_j else None
+                p75j_d = _p75(hj["pm_dec3"])  if n_j else None
+                p75j_a = _p75(hj["pm_acc3"])  if n_j else None
+
+                hg = _hist_grupo(linea, fch)
+                n_g = len(hg)
+                p75g_s = _p75(hg["pm_sdist"]) if n_g else None
+                p75g_h = _p75(hg["pm_hsr"])   if n_g else None
+                p75g_d = _p75(hg["pm_dec3"])  if n_g else None
+                p75g_a = _p75(hg["pm_acc3"])  if n_g else None
+
+                wj, wg = min(n_j, 5), 5
+                def mix(pj, pg):
+                    if pj is not None and pg is not None and (wj+wg)>0: return (wj*pj + wg*pg)/(wj+wg)
+                    return pj if pj is not None else pg
+
+                P75_s, P75_h, P75_d, P75_a = mix(p75j_s,p75g_s), mix(p75j_h,p75g_h), mix(p75j_d,p75g_d), mix(p75j_a,p75g_a)
+
+                comps, wsum = [], 0.0
+                if P75_s: comps.append(pm_s / P75_s); wsum += 1.0
+                if P75_h: comps.append(pm_h / P75_h); wsum += 1.0
+                if P75_d: comps.append(pm_d / P75_d); wsum += 1.0
+                if P75_a: comps.append(pm_a / P75_a); wsum += 1.0  # sacar si no querés Acc3
+
+                if wsum == 0:
+                    score_raw = 1.0
+                    perf_pct  = 100.0
+                    sin_base  = 1
+                else:
+                    score_raw = float(sum(comps)/wsum)
+                    perf_pct  = 100.0 * min(score_raw, 1.5)
+                    sin_base  = 0
+
+                updates.append((
+                    perf_pct, sin_base,
+                    P75_s, P75_h, P75_d, P75_a,
+                    pm_s, pm_h, pm_d, pm_a,
+                    score_raw, min(score_raw, 1.5),
+                    int(r.id_partido)
+                ))
+
+            # construir UPDATE según columnas disponibles (por si alguna falta en otra DB)
+            sql_set = []
+            sql_set.append("Performance = ?")
+            sql_set.append("Perf_SinBaseline = ?")
+            if has("P75_sdist"):             sql_set.append("P75_sdist = ?")
+            if has("P75_hsr"):               sql_set.append("P75_hsr = ?")
+            if has("P75_dec3"):              sql_set.append("P75_dec3 = ?")
+            if has("P75_acc3"):              sql_set.append("P75_acc3 = ?")
+            if has("Perf_SprintsDist_xMin"): sql_set.append("Perf_SprintsDist_xMin = ?")
+            if has("Perf_HSR_xMin"):         sql_set.append("Perf_HSR_xMin = ?")
+            if has("Perf_Dec3_xMin"):        sql_set.append("Perf_Dec3_xMin = ?")
+            if has("Perf_Acc3_xMin"):        sql_set.append("Perf_Acc3_xMin = ?")
+            if has("Perf_Score_raw"):        sql_set.append("Perf_Score_raw = ?")
+            if has("Perf_Score_pct"):        sql_set.append("Perf_Score_pct = ?")
+
+            set_clause = ",\n    ".join(sql_set)
+
+            # Mapear cada tupla 'updates' al orden real de columnas incluidas en set_clause
+            def map_row(u):
+                # orden superset:
+                superset = [
+                    ("Performance", u[0]),
+                    ("Perf_SinBaseline", u[1]),
+                    ("P75_sdist", u[2]),
+                    ("P75_hsr",   u[3]),
+                    ("P75_dec3",  u[4]),
+                    ("P75_acc3",  u[5]),
+                    ("Perf_SprintsDist_xMin", u[6]),
+                    ("Perf_HSR_xMin",         u[7]),
+                    ("Perf_Dec3_xMin",        u[8]),
+                    ("Perf_Acc3_xMin",        u[9]),
+                    ("Perf_Score_raw",        u[10]),
+                    ("Perf_Score_pct",        u[11]),
+                ]
+                out = [val for name, val in superset if has(name)]
+                out.append(u[12])  # id_partido al final para el WHERE
+                return tuple(out)
+
+            updates_mapped = [map_row(u) for u in updates]
+
+            sql = f"""
+            UPDATE DB_Partidos
+            SET {set_clause}
+            WHERE id_partido = ?;
+            """
+            conn.executemany(sql, updates_mapped)
+            conn.commit()
+            print(f"[OK] Performance actualizado en {len(updates)} partidos.")
+            return len(updates)
 
 
 
