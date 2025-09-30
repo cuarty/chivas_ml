@@ -3320,8 +3320,251 @@ class ETLChivas:
         
         return self.upsert_partidos(df[columnas_requeridas])
 
+
 # ============================================================
-# 20- Helper para leer excel 97-2003
+# 20- Helpers específicos para microciclos (import, join, agregados)
+# ============================================================
+
+    def actualizar_tabla_microciclos_excel(self, ruta_excel: Path = None) -> int:
+        import pandas as pd
+        from pathlib import Path
+
+        ruta_excel = Path(ruta_excel) if ruta_excel else Path("data/ref/Microciclos.xlsx")
+        if not ruta_excel.exists():
+            print(f"[WARN] No existe {ruta_excel.name}, omito importación de microciclos.")
+            return 0
+
+        df = pd.read_excel(ruta_excel)
+        df["Fecha"] = pd.to_datetime(df["Fecha"]).dt.date
+
+        req = ["Fecha","Microciclo_Num","Tipo_Microciclo","Fase","Tipo_Dia","Intensidad","Partido"]
+        faltan = [c for c in req if c not in df.columns]
+        if faltan:
+            raise ValueError(f"Faltan columnas en Microciclos.xlsx: {faltan}")
+
+        # Nueva columna con intensidad imputada SOLO para Competencia+ENTRENO
+        df["Intensidad_plan"] = df["Intensidad"]
+        mask = (df["Tipo_Microciclo"] == "Competencia") & (df["Tipo_Dia"] == "ENTRENO")
+        # ffill/bfill por microciclo
+        def _fill(g):
+            g = g.sort_values("Fecha")
+            g["Intensidad_plan"] = g["Intensidad"].ffill().bfill()
+            return g
+        df.loc[mask, :] = df.loc[mask, :].groupby("Microciclo_Num", group_keys=False).apply(_fill)
+
+        with self._conectar() as con:
+            df.to_sql("DB_MicrociclosExcel", con, if_exists="replace", index=False)
+        print("[OK] DB_MicrociclosExcel actualizada (con Intensidad_plan).")
+        return len(df)
+
+
+
+    def _asegurar_campos_entrenamientos_para_microciclos(self):
+        """
+        Agrega columnas Microciclo_Num, Tipo_Microciclo, Fase, Tipo_Dia, Intensidad si faltan.
+        Remueve Rendimiento_Semanal si existe.
+        """
+        cols_necesarias = {
+            "Microciclo_Num": "INTEGER",
+            "Tipo_Microciclo": "TEXT",
+            "Fase": "TEXT",
+            "Tipo_Dia": "TEXT",
+            "Intensidad": "REAL"
+        }
+        with self._conectar() as con:
+            cur = con.execute("PRAGMA table_info(DB_Entrenamientos)")
+            cols_db = {row[1] for row in cur.fetchall()}
+
+            for col, tipo in cols_necesarias.items():
+                if col not in cols_db:
+                    con.execute(f"ALTER TABLE DB_Entrenamientos ADD COLUMN {col} {tipo}")
+
+            # Si tu SQLite soporta DROP COLUMN (>=3.35). Si no, lo dejamos.
+            if "Rendimiento_Semanal" in cols_db:
+                try:
+                    con.execute("ALTER TABLE DB_Entrenamientos DROP COLUMN Rendimiento_Semanal")
+                    print("[OK] Eliminado Rendimiento_Semanal")
+                except Exception as e:
+                    print(f"[WARN] No se pudo eliminar Rendimiento_Semanal (SQLite antiguo): {e}")
+
+
+    def _anotar_microciclo_en_entrenamientos_existentes(self):
+        """
+        Completa Microciclo_Num, Tipo_Microciclo, Fase, Tipo_Dia, Intensidad
+        en filas que ya existen (match por Fecha).
+        """
+        with self._conectar() as con:
+            con.execute("""
+            UPDATE DB_Entrenamientos AS e
+            SET 
+            Microciclo_Num  = (SELECT m.Microciclo_Num  FROM DB_MicrociclosExcel m WHERE m.Fecha = e.Fecha),
+            Tipo_Microciclo = (SELECT m.Tipo_Microciclo FROM DB_MicrociclosExcel m WHERE m.Fecha = e.Fecha),
+            Fase            = (SELECT m.Fase            FROM DB_MicrociclosExcel m WHERE m.Fecha = e.Fecha),
+            -- OJO: no pisamos Tipo_Dia/Intensidad de descansos autogenerados
+            Tipo_Dia        = COALESCE(
+                                CASE WHEN COALESCE(e.Auto_Descanso,0)=1 THEN e.Tipo_Dia END,
+                                (SELECT m.Tipo_Dia FROM DB_MicrociclosExcel m WHERE m.Fecha=e.Fecha)
+                                ),
+            Intensidad      = COALESCE(
+                                CASE WHEN COALESCE(e.Auto_Descanso,0)=1 THEN e.Intensidad END,
+                                (SELECT m.Intensidad FROM DB_MicrociclosExcel m WHERE m.Fecha=e.Fecha)
+                                )
+            WHERE EXISTS (SELECT 1 FROM DB_MicrociclosExcel m WHERE m.Fecha = e.Fecha)
+                AND COALESCE(e.Auto_Descanso,0)=0;   -- ⬅️ no tocar filas autogeneradas
+            """)
+
+
+    def _rellenar_huecos_con_descanso(self):
+        """
+        Inserta, para cada jugador, SOLO las fechas del Excel que NO son PARTIDO
+        y que no tienen registro en DB_Entrenamientos (hasta la última fecha existente),
+        con métricas en 0. 
+        - Si el Excel dice ENTRENO y el jugador no asistió → se crea fila como DESCANSO.
+        - Marca la fila con Auto_Descanso=1 para evitar que sea pisada luego.
+        """
+        with self._conectar() as con:
+            # Fecha máxima de datos existentes en DB_Entrenamientos
+            fmax_row = con.execute("SELECT MAX(Fecha) FROM DB_Entrenamientos").fetchone()
+            fmax = fmax_row[0]
+            if not fmax:
+                print("[WARN] No hay entrenamientos cargados; omito relleno de huecos.")
+                return 0
+
+            # Obtener columnas reales de la tabla
+            cols_db = {row[1] for row in con.execute("PRAGMA table_info(DB_Entrenamientos)")}
+
+            # Columnas base que deben existir
+            base_preferidos = [
+                "Fecha", "id_jugador", "Microciclo_Num", "Tipo_Microciclo", 
+                "Fase", "Tipo_Dia", "Intensidad"
+            ]
+            base_cols = [c for c in base_preferidos if c in cols_db]
+
+            # Detectar si existe columna Auto_Descanso y agregarla
+            if "Auto_Descanso" in cols_db:
+                base_cols.append("Auto_Descanso")
+
+            # Columnas de métricas físicas
+            metric_candidatas = [
+                "Distancia_total","HSR_abs_m","HMLD_m","Sprints_distancia_m","Sprints_cantidad",
+                "Sprints_vel_max_kmh","Acc_3","Dec_3","Player_Load","RPE",
+                "Carga_Explosiva","Carga_Sostenida","Carga_Regenerativa",
+                "Rendimiento_Diario","HSR_rel_m","Velocidad_prom_m_min"
+            ]
+            metric_cols = [c for c in metric_candidatas if c in cols_db]
+
+            # Todas las columnas a insertar
+            insert_cols = base_cols + metric_cols
+
+            # Función para mapear valores del SELECT
+            def _expr(c):
+                if c == "Fecha":             return "m.Fecha"
+                if c == "id_jugador":        return "j.id_jugador"
+                if c == "Microciclo_Num":    return "m.Microciclo_Num"
+                if c == "Tipo_Microciclo":   return "m.Tipo_Microciclo"
+                if c == "Fase":              return "m.Fase"
+                if c == "Tipo_Dia":
+                    # Si el día estaba planificado como ENTRENO pero el jugador no estuvo → DESCANSO
+                    return "CASE WHEN m.Tipo_Dia='ENTRENO' THEN 'DESCANSO' ELSE m.Tipo_Dia END"
+                if c == "Intensidad":
+                    # Descanso = 0, Pretemporada = NULL, Competencia = intensidad planificada
+                    return (
+                        "CASE "
+                        "WHEN m.Tipo_Microciclo='Pretemporada' THEN NULL  "
+                        "WHEN m.Tipo_Dia='ENTRENO' THEN 0 "
+                        "ELSE COALESCE(m.Intensidad_plan, m.Intensidad)"
+                        "END"
+                    )
+                if c == "Auto_Descanso":
+                    return "1"  # Marca explícitamente que la fila fue generada automáticamente
+                return "0"  # Todas las métricas en 0
+
+            # Generar expresiones para el SELECT
+            select_expr = [_expr(c) for c in insert_cols]
+
+            # Query final
+            sql = f"""
+            INSERT INTO DB_Entrenamientos ({", ".join(insert_cols)})
+            SELECT {", ".join(select_expr)}
+            FROM DB_Jugadores j
+            JOIN DB_MicrociclosExcel m ON 1=1
+            LEFT JOIN DB_Entrenamientos e
+                ON e.id_jugador=j.id_jugador AND e.Fecha=m.Fecha
+            WHERE e.id_entrenamiento IS NULL
+            AND m.Tipo_Dia != 'PARTIDO'   -- No insertar días de partido
+            AND m.Fecha <= DATE(?)
+            """
+            
+            # Ejecutar y retornar cantidad de cambios
+            con.execute(sql, (fmax,))
+            return con.total_changes
+
+
+    def actualizar_db_entrenamientos(self):
+        self._asegurar_campos_entrenamientos_para_microciclos()
+        self._anotar_microciclo_en_entrenamientos_existentes()
+        n = self._rellenar_huecos_con_descanso()
+
+        # Garantizar que NO existan filas de PARTIDO en DB_Entrenamientos
+        with self._conectar() as con:
+            # Forzar coherencia definitiva
+            # a) DESCANSO siempre intensidad 0
+            con.execute("""
+                UPDATE DB_Entrenamientos
+                SET Intensidad = 0
+                WHERE Tipo_Dia='DESCANSO'
+            """)
+            # b) PRETEMPORADA siempre intensidad NULL
+            con.execute("""
+                UPDATE DB_Entrenamientos
+                SET Intensidad = NULL
+                WHERE Tipo_Microciclo='Pretemporada'
+            """)
+            # c) Eliminar cualquier PARTIDO que haya quedado por herencia
+            con.execute("""
+                DELETE FROM DB_Entrenamientos
+                WHERE Fecha IN (SELECT Fecha FROM DB_MicrociclosExcel WHERE Tipo_Dia='PARTIDO')
+            """)
+            # Los descansos autogenerados SIEMPRE deben quedar como descanso e intensidad 0
+            con.execute("""
+                UPDATE DB_Entrenamientos
+                SET Tipo_Dia='DESCANSO', Intensidad=0
+                WHERE COALESCE(Auto_Descanso,0)=1
+            """)
+
+
+    def generar_tabla_db_microciclo(self):
+        """
+        Crea/repone DB_Microciclo con sumas por (id_jugador, Microciclo_Num),
+        detectando dinámicamente qué métricas existen en DB_Entrenamientos.
+        """
+        with self._conectar() as con:
+            cols_db = {row[1] for row in con.execute("PRAGMA table_info(DB_Entrenamientos)")}
+            metric_candidatas = [
+                "Distancia_total","HSR_abs_m","HMLD_m","Sprints_distancia_m","Sprints_cantidad",
+                "Sprints_vel_max_kmh","Acc_3","Dec_3","Player_Load","RPE",
+                "Carga_Explosiva","Carga_Sostenida","Carga_Regenerativa",
+                "Rendimiento_Diario","HSR_rel_m","Velocidad_prom_m_min"
+            ]
+            metric_cols = [c for c in metric_candidatas if c in cols_db]
+            sums = ",\n               ".join([f"SUM(COALESCE({c},0)) AS {c}_Total" for c in metric_cols]) or "0 AS dummy"
+
+            con.execute("DROP TABLE IF EXISTS DB_Microciclo")
+            con.execute(f"""
+            CREATE TABLE DB_Microciclo AS
+            SELECT 
+                id_jugador,
+                Microciclo_Num,
+                {sums}
+            FROM DB_Entrenamientos
+            GROUP BY id_jugador, Microciclo_Num
+            """)
+        print("[OK] DB_Microciclo creada/actualizada.")
+
+
+
+# ============================================================
+# 21- Helper para leer excel 97-2003
 # ============================================================
 
     def _detectar_formato_excel(self, ruta: Path) -> str:
@@ -3366,7 +3609,7 @@ class ETLChivas:
         return pd.read_excel(ruta)
 
 # ============================================================
-# 21- Carga de referencia de jugadores
+# 22- Carga de referencia de jugadores
 # ============================================================ 
 
     def cargar_db_jugadores(self, ruta_excel: Path) -> int:
@@ -3442,7 +3685,7 @@ class ETLChivas:
             traceback.print_exc()
             return 0
 
-# en pipeline.py (o helpers.py)
+
 
 
 

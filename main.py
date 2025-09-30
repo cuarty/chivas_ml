@@ -188,22 +188,28 @@ def main():
         n = etl.cargar_lesiones_desde_excel(ruta_lesiones)
         print(f"[OK] Lesiones cargadas/actualizadas: {n}")
     
-    # 7. PROCESAR ENTRENAMIENTOS
+    # 7. Actualizar microciclos y entrenamientos
+    print("\n[INFO] Actualizando microciclos y entrenamientos...")
+    etl.actualizar_tabla_microciclos_excel()
+    etl.actualizar_db_entrenamientos()
+    etl.generar_tabla_db_microciclo()
+
+    # 8. PROCESAR ENTRENAMIENTOS
     resultado_entrenos = procesar_entrenamientos_dir(etl, rutas['RAW_ENTRENAMIENTOS'])
     print(f"\n[RESUMEN] Entrenamientos procesados: {resultado_entrenos['entrenamientos']}")
     print(f"[RESUMEN] Semanal actualizado: {resultado_entrenos['filas_rendimiento_semanal']}")
     
-    # 8. PROCESAR PARTIDOS
+    # 9. PROCESAR PARTIDOS
     n_partidos = procesar_partidos_dir(etl, rutas['RAW_PARTIDOS'])
     print(f"\n[RESUMEN] Partidos actualizados (carpeta): {n_partidos}")
     
-    # 9. Procesar archivo maestro legacy (si existe)
+    # 10. Procesar archivo maestro legacy (si existe)
     if rutas['PARTIDOS_MASTER'].exists():
         print("\n[INFO] Procesando PARTIDOS desde master legacy…")
         n_partidos += procesar_partidos(etl, rutas['PARTIDOS_MASTER'])
         print(f"[RESUMEN] Partidos total (carpeta + master): {n_partidos}")
     
-    # 10. CONSOLIDAR DATOS (con manejo de errores mejorado)
+    # 11. CONSOLIDAR DATOS (con manejo de errores mejorado)
     try:
         print("Intentando consolidar rivales...")
         
@@ -225,10 +231,10 @@ def main():
     except Exception as e:
         print(f"[ERROR] Error inesperado durante consolidación: {e}")
 
-    # 11. Validar aliases nuevamente después de procesar todo
+    # 12. Validar aliases nuevamente después de procesar todo
     etl.validar_aliases()
     
-    # 12. Resumen final
+    # 13. Resumen final
     with etl._conectar() as conn:
         resumen = {
             'Jugadores': pd.read_sql("SELECT COUNT(*) FROM DB_Jugadores", conn).iloc[0,0],
@@ -239,7 +245,7 @@ def main():
         for k, v in resumen.items():
             print(f"{k}: {v}")
     
-    # 13. Debug info
+    # 14. Debug info
     with etl._conectar() as conn:
         print("\n[DEBUG] Resumen de entrenamientos cargados:")
         resumen_entrenos = pd.read_sql("""
