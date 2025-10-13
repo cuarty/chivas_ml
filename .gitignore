@@ -39,3 +39,11 @@ data/tmp/**
 
 # Windows device ghost
 NUL
+
+# ML artifacts
+models/
+src/chivas_ml/ml/registry/
+data/processed/ml/
+**/*.pkl
+**/*.joblib
+**/mlruns/

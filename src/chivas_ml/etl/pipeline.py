@@ -276,11 +276,6 @@ class ETLChivas:
             CREATE UNIQUE INDEX IF NOT EXISTS uq_part_jugador_fecha_rival
                 ON DB_Partidos(id_jugador, Fecha, ifnull(id_rival,-1));
 
-            CREATE UNIQUE INDEX IF NOT EXISTS uq_rend_semanal_jugador_fecha
-                ON Rendimiento_Semanal(id_jugador, Fecha);
-
-            CREATE INDEX IF NOT EXISTS idx_rend_semanal_jugador_fecha
-                ON Rendimiento_Semanal(id_jugador, Fecha);
 
             CREATE TABLE IF NOT EXISTS DB_Lesiones (
                 id_lesion     INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2009,258 +2004,146 @@ class ETLChivas:
         # Lunes como inicio de semana
         return (d - pd.to_timedelta(d.dt.weekday, unit="D")).dt.date.astype(str)
 
-    def recalcular_rendimiento_semanal(self, jugadores: Optional[Iterable[int]] = None) -> int:
-        """
-        Calcula promedios semanales por jugador a partir de DB_Entrenamientos
-        y los upsertea en Rendimiento_Semanal (Fecha = lunes de esa semana).
-        """
-        with self._conectar() as conn:
-            consulta = "SELECT * FROM DB_Entrenamientos"
-            if jugadores:
-                lista = ",".join(map(str, jugadores))
-                consulta += f" WHERE id_jugador IN ({lista})"
-            df = pd.read_sql(consulta, conn)
+    def recalcular_rendimiento_semanal(self, jugadores=None) -> int:
+        """[DEPRECATED] Reemplazado por tablas de microciclo."""
+        return 0
 
-        if df.empty:
-            return 0
-
-        df["Fecha"] = pd.to_datetime(df["Fecha"], errors="coerce")
-        df = df.dropna(subset=["Fecha", "id_jugador"])
-        df["Semana"] = self._inicio_semana(df["Fecha"])
-
-        sem = df.groupby(["id_jugador", "Semana"], as_index=False).agg(
-            Promedio_Carga_Explosiva=("Carga_Explosiva", "mean"),
-            Promedio_Carga_Sostenida=("Carga_Sostenida", "mean"),
-            Promedio_Carga_Regenerativa=("Carga_Regenerativa", "mean"),
-            Promedio_Rendimiento=("Rendimiento_Diario", "mean"),
-        ).rename(columns={"Semana": "Fecha"})
-
-        columnas = [
-            "id_jugador", "Fecha",
-            "Promedio_Carga_Explosiva", "Promedio_Carga_Sostenida",
-            "Promedio_Carga_Regenerativa", "Promedio_Rendimiento",
-        ]
-
-        with self._conectar() as conn:
-            placeholders = ",".join(["?"] * len(columnas))
-            set_clause = ",".join([f"{c}=excluded.{c}" for c in columnas if c != "id"])
-            sql = f"""
-            INSERT INTO Rendimiento_Semanal ({",".join(columnas)})
-            VALUES ({placeholders})
-            ON CONFLICT(id_jugador, Fecha) DO UPDATE SET {set_clause};
-            """
-            data = sem[columnas].where(pd.notnull(sem[columnas]), None).values.tolist()
-            conn.executemany(sql, data)
-        return len(sem)
 
     def _actualizar_sobrecargas(
         self,
-        jugadores=None,
-        fecha_desde=None,
-        fecha_hasta=None,
-        min_sesiones_28d: int = 8
-    ) -> None:
+        jugadores: Optional[Iterable[int]] = None,
+        fecha_desde: Optional[str] = None,
+        fecha_hasta: Optional[str] = None,
+        incluir_dia_partido: bool = True,   # ⬅ igual que tu DAX en Entrenamientos
+        promedio: str = "semanal",          # "semanal" -> SUM_28/4 ; "diario" -> promedio diario 28d
+    ) -> int:
+        """
+        Recalcula ACWR para cada partido:
+        - Ventanas continuas con días en 0 (descansos).
+        - 7d = (hoy + 6 previos) si incluir_dia_partido=True, o 7 previos si False.
+        - 28d = (hoy + 27 previos) o 28 previos, según incluir_dia_partido.
+        - promedio: "semanal" (SUM_28/4) o "diario" (AVG_28).
+        Devuelve # de partidos actualizados.
+        """
         import pandas as pd
-        from datetime import timedelta
+        import sqlite3
 
-        # --- helper: asegurar columnas nuevas si no existen
-        def _ensure_cols(conn):
-            cols = pd.read_sql("PRAGMA table_info(DB_Partidos)", conn)["name"].tolist()
-            to_add = []
-            for name, dtype in [
-                ("CE_prev7d_pre", "REAL"), ("CS_prev7d_pre", "REAL"), ("CR_prev7d_pre", "REAL"),
-                ("dias_entreno_prev7d_pre", "INTEGER"), ("CT_7d_pre", "REAL"),
-            ]:
-                if name not in cols:
-                    to_add.append((name, dtype))
-            for name, dtype in to_add:
-                conn.execute(f"ALTER TABLE DB_Partidos ADD COLUMN {name} {dtype}")
-            if to_add:
-                conn.commit()
+        def _cls(acwr: Optional[float]) -> str:
+            if acwr is None: return "Sin datos"
+            if acwr < 0.80:  return "Subcarga"
+            if acwr <= 1.30: return "Óptima"
+            return "Sobrecarga"
 
-        with self._conectar() as conn:
-            _ensure_cols(conn)
+        def _make_window_bounds(fref_ts: pd.Timestamp, dias: int, incluir: bool) -> tuple[pd.Timestamp, pd.Timestamp]:
+            if incluir:
+                # ej. 7d = hoy + 6 previos
+                inicio = fref_ts - pd.Timedelta(days=dias - 1)
+                fin    = fref_ts
+            else:
+                # ej. 7d = 7 previos SIN incluir hoy
+                inicio = fref_ts - pd.Timedelta(days=dias)
+                fin    = fref_ts - pd.Timedelta(days=1)
+            return inicio.normalize(), fin.normalize()
 
-            # --- Partidos a recalcular
-            conds, params = [], []
+        def _window_ct(con: sqlite3.Connection, jid: int, fref: str, dias: int, incluir: bool) -> pd.DataFrame:
+            """
+            Devuelve dataframe continuo por día con CE, CS, CR, CT (sumando entrenos+partidos) y huecos en 0.
+            """
+            fref_ts = pd.to_datetime(fref)
+            ini_ts, fin_ts = _make_window_bounds(fref_ts, dias, incluir)
+
+            q_ent = """
+                SELECT Fecha,
+                    COALESCE(Carga_Explosiva,0)    AS CE_e,
+                    COALESCE(Carga_Sostenida,0)    AS CS_e,
+                    COALESCE(Carga_Regenerativa,0) AS CR_e
+                FROM DB_Entrenamientos
+                WHERE id_jugador=? AND date(Fecha) BETWEEN date(?) AND date(?)
+            """
+            q_par = """
+                SELECT Fecha,
+                    COALESCE(Carga_Explosiva,0)    AS CE_p,
+                    COALESCE(Carga_Sostenida,0)    AS CS_p,
+                    COALESCE(Carga_Regenerativa,0) AS CR_p
+                FROM DB_Partidos
+                WHERE id_jugador=? AND date(Fecha) BETWEEN date(?) AND date(?)
+            """
+            e = pd.read_sql(q_ent, con, params=[jid, ini_ts.date().isoformat(), fin_ts.date().isoformat()])
+            p = pd.read_sql(q_par, con, params=[jid, ini_ts.date().isoformat(), fin_ts.date().isoformat()])
+
+            if not e.empty:
+                e["Fecha"] = pd.to_datetime(e["Fecha"]).dt.normalize(); e = e.set_index("Fecha")
+            if not p.empty:
+                p["Fecha"] = pd.to_datetime(p["Fecha"]).dt.normalize(); p = p.set_index("Fecha")
+
+            idx = pd.date_range(ini_ts, fin_ts, freq="D")
+            w = (e.join(p, how="outer") if (not e.empty or not p.empty) else pd.DataFrame(index=idx)).reindex(idx)
+
+            for c in ["CE_e","CS_e","CR_e","CE_p","CS_p","CR_p"]:
+                if c not in w.columns: w[c] = 0.0
+                w[c] = w[c].fillna(0.0)
+
+            w["CE"] = w["CE_e"] + w["CE_p"]
+            w["CS"] = w["CS_e"] + w["CS_p"]
+            w["CR"] = w["CR_e"] + w["CR_p"]
+            w["CT"] = w["CE"] + w["CS"] + w["CR"]
+            return w
+
+        with self._conectar() as con:
+            # Partidos a recalcular
+            sql = ["SELECT id_partido, id_jugador, Fecha FROM DB_Partidos WHERE 1=1"]
+            params = []
+            if fecha_desde: sql += ["AND date(Fecha) >= date(?)"]; params += [fecha_desde]
+            if fecha_hasta: sql += ["AND date(Fecha) <= date(?)"]; params += [fecha_hasta]
             if jugadores:
-                marks = ",".join("?" for _ in jugadores)
-                conds.append(f"p.id_jugador IN ({marks})")
-                params.extend(list(map(int, jugadores)))
-            if fecha_desde:
-                conds.append("date(p.Fecha) >= ?"); params.append(fecha_desde)
-            if fecha_hasta:
-                conds.append("date(p.Fecha) <= ?"); params.append(fecha_hasta)
-            where = "WHERE " + " AND ".join(conds) if conds else ""
+                marks = ",".join("?" * len(list(jugadores))); sql += [f"AND id_jugador IN ({marks})"]; params += list(jugadores)
+            sql += ["ORDER BY Fecha, id_jugador"]
+            dfp = pd.read_sql(" ".join(sql), con, params=params)
 
-            dfp = pd.read_sql(
-                f"""SELECT p.id_partido, p.id_jugador, date(p.Fecha) AS Fecha,
-                        COALESCE(p.Carga_Explosiva,0.0) AS CE_part,
-                        COALESCE(p.Carga_Sostenida,0.0) AS CS_part,
-                        COALESCE(p.Carga_Regenerativa,0.0) AS CR_part
-                    FROM DB_Partidos p
-                    {where}""",
-                conn, params=params
-            )
-            if dfp.empty: 
-                return
+            if dfp.empty:
+                print("[INFO] _actualizar_sobrecargas: no hay partidos en el rango."); return 0
 
-            # --- Entrenos y partidos (para 28d y 7d)
-            fmin = pd.to_datetime(dfp["Fecha"]).min().date()
-            fmax = pd.to_datetime(dfp["Fecha"]).max().date()
-            fmin_q = (fmin - timedelta(days=28)).isoformat()
-            fmax_q = fmax.isoformat()
+            batch = []
+            for _, r in dfp.iterrows():
+                jid  = int(r["id_jugador"])
+                fref = pd.to_datetime(r["Fecha"]).date().isoformat()
 
-            marks_j = ",".join("?" for _ in dfp["id_jugador"].unique())
-            params_ent = list(map(int, dfp["id_jugador"].unique())) + [fmin_q, fmax_q]
+                w7   = _window_ct(con, jid, fref, 7,  incluir_dia_partido)
+                w28  = _window_ct(con, jid, fref, 28, incluir_dia_partido)
 
-            dfe = pd.read_sql(
-                f"""SELECT id_jugador, date(Fecha) AS Fecha,
-                        COALESCE(Carga_Explosiva,0.0) AS CE,
-                        COALESCE(Carga_Sostenida,0.0) AS CS,
-                        COALESCE(Carga_Regenerativa,0.0) AS CR
-                    FROM DB_Entrenamientos
-                    WHERE id_jugador IN ({marks_j})
-                    AND date(Fecha) >= ? AND date(Fecha) <= ?""",
-                conn, params=params_ent
-            )
+                ce7, cs7, cr7 = float(w7["CE"].sum()), float(w7["CS"].sum()), float(w7["CR"].sum())
+                ct7           = ce7 + cs7 + cr7
 
-            dfp_hist = pd.read_sql(
-                f"""SELECT id_jugador, date(Fecha) AS Fecha,
-                        COALESCE(Carga_Explosiva,0.0) AS CEp,
-                        COALESCE(Carga_Sostenida,0.0) AS CSp,
-                        COALESCE(Carga_Regenerativa,0.0) AS CRp
-                    FROM DB_Partidos
-                    WHERE id_jugador IN ({marks_j})
-                    AND date(Fecha) >= ? AND date(Fecha) <= ?""",
-                conn, params=[*map(int, dfp["id_jugador"].unique()), fmin_q, fmax_q]
-            )
-
-        # --- Agrupar por día
-        def group_ent(df):
-            if df.empty: 
-                return df
-            g = df.copy()
-            g["Fecha"] = pd.to_datetime(g["Fecha"]).dt.date
-            g = g.groupby(["id_jugador","Fecha"], as_index=False).agg(
-                CE=("CE","sum"), CS=("CS","sum"), CR=("CR","sum")
-            )
-            g["CT_dia"] = g["CE"] + g["CS"] + g["CR"]
-            return g
-
-        def group_par(df):
-            if df.empty:
-                return df
-            g = df.copy()
-            g["Fecha"] = pd.to_datetime(g["Fecha"]).dt.date
-            g = g.groupby(["id_jugador","Fecha"], as_index=False).agg(
-                CEp=("CEp","sum"), CSp=("CSp","sum"), CRp=("CRp","sum")
-            )
-            g["CTp_dia"] = g["CEp"] + g["CSp"] + g["CRp"]
-            return g
-
-        ent = group_ent(dfe)
-        par = group_par(dfp_hist)
-        ent_by = {k: v.sort_values("Fecha") for k, v in ent.groupby("id_jugador")}
-        par_by = {k: v.sort_values("Fecha") for k, v in par.groupby("id_jugador")}
-
-        updates = []
-
-        for row in dfp.itertuples(index=False):
-            pid = row.id_partido
-            jid = int(row.id_jugador)
-            fch = pd.to_datetime(row.Fecha).date()
-
-            ge = ent_by.get(jid)  # entrenos por día
-            gp = par_by.get(jid)  # partidos por día
-
-            # ---- Ventana PREVIA pura: [f-7, f-1]  (NO incluye match-day)
-            pre_ini, pre_fin = fch - timedelta(days=7), fch - timedelta(days=1)
-            win7e_pre = ge.loc[(ge["Fecha"] >= pre_ini) & (ge["Fecha"] <= pre_fin)] if ge is not None else None
-            win7p_pre = gp.loc[(gp["Fecha"] >= pre_ini) & (gp["Fecha"] <= pre_fin)] if gp is not None else None
-
-            CE7_pre = (0.0 if win7e_pre is None or win7e_pre.empty else float(win7e_pre["CE"].sum())) \
-                    + (0.0 if win7p_pre is None or win7p_pre.empty else float(win7p_pre["CEp"].sum()))
-            CS7_pre = (0.0 if win7e_pre is None or win7e_pre.empty else float(win7e_pre["CS"].sum())) \
-                    + (0.0 if win7p_pre is None or win7p_pre.empty else float(win7p_pre["CSp"].sum()))
-            CR7_pre = (0.0 if win7e_pre is None or win7e_pre.empty else float(win7e_pre["CR"].sum())) \
-                    + (0.0 if win7p_pre is None or win7p_pre.empty else float(win7p_pre["CRp"].sum()))
-            dias7_pre = len(pd.concat(
-                [win7e_pre[["Fecha"]] if win7e_pre is not None else pd.DataFrame(),
-                win7p_pre[["Fecha"]] if win7p_pre is not None else pd.DataFrame()]
-            ).drop_duplicates()) if (win7e_pre is not None or win7p_pre is not None) else 0
-            CT7_pre = CE7_pre + CS7_pre + CR7_pre
-
-            # ---- Ventana POST (aguda/ACWR): [f-6, f]  (INCLUYE match-day)
-            post_ini, post_fin = fch - timedelta(days=6), fch
-            win7e_post = ge.loc[(ge["Fecha"] >= post_ini) & (ge["Fecha"] <= post_fin)] if ge is not None else None
-            win7p_post = gp.loc[(gp["Fecha"] >= post_ini) & (gp["Fecha"] <= post_fin)] if gp is not None else None
-
-            CE7_post = (0.0 if win7e_post is None or win7e_post.empty else float(win7e_post["CE"].sum())) \
-                    + (0.0 if win7p_post is None or win7p_post.empty else float(win7p_post["CEp"].sum()))
-            CS7_post = (0.0 if win7e_post is None or win7e_post.empty else float(win7e_post["CS"].sum())) \
-                    + (0.0 if win7p_post is None or win7p_post.empty else float(win7p_post["CSp"].sum()))
-            CR7_post = (0.0 if win7e_post is None or win7e_post.empty else float(win7e_post["CR"].sum())) \
-                    + (0.0 if win7p_post is None or win7p_post.empty else float(win7p_post["CRp"].sum()))
-            dias7_post = len(pd.concat(
-                [win7e_post[["Fecha"]] if win7e_post is not None else pd.DataFrame(),
-                win7p_post[["Fecha"]] if win7p_post is not None else pd.DataFrame()]
-            ).drop_duplicates()) if (win7e_post is not None or win7p_post is not None) else 0
-            CT7_post = CE7_post + CS7_post + CR7_post
-
-            # ---- Baseline 28d (solo días con carga) para ACWR semanal (sum/4)
-            f28_ini, f28_fin = fch - timedelta(days=28), fch - timedelta(days=1)
-            w28e = ge.loc[(ge["Fecha"] >= f28_ini) & (ge["Fecha"] <= f28_fin)][["Fecha","CT_dia"]] if ge is not None else None
-            w28p = gp.loc[(gp["Fecha"] >= f28_ini) & (gp["Fecha"] <= f28_fin)][["Fecha","CTp_dia"]] if gp is not None else None
-
-            if (w28e is not None and not w28e.empty) or (w28p is not None and not w28p.empty):
-                w = (w28e.rename(columns={"CT_dia":"CT"}) if w28e is not None else pd.DataFrame(columns=["Fecha","CT"])) \
-                    .merge((w28p.rename(columns={"CTp_dia":"CT"}) if w28p is not None else pd.DataFrame(columns=["Fecha","CT"])),
-                        on="Fecha", how="outer", suffixes=("_e","_p"))
-                w["CT"] = w.get("CT_e", 0).fillna(0) + w.get("CT_p", 0).fillna(0)
-                dias_carga_28d = int((w["CT"] > 0).sum())
-                ct28_sum = float(w["CT"].sum())
-            else:
-                dias_carga_28d, ct28_sum = 0, 0.0
-
-            if dias_carga_28d >= min_sesiones_28d and ct28_sum > 0:
-                CT28avg = ct28_sum / 4.0
-                acwr = (CT7_post / CT28avg) if CT28avg > 0 else None
-                acwr_pct = (100.0 * acwr) if acwr is not None else None
-                if acwr is None:
-                    flag = "Sin baseline"
-                elif acwr < 0.80:
-                    flag = "Baja"
-                elif acwr <= 1.30:
-                    flag = "Óptima"
-                elif acwr <= 1.50:
-                    flag = "Alta"
+                ct28_sum = float(w28["CT"].sum())
+                if promedio == "semanal":
+                    ct28_avg = (ct28_sum / 4.0) if ct28_sum > 0 else None
                 else:
-                    flag = "Muy alta"
-            else:
-                CT28avg, acwr, acwr_pct, flag = None, None, None, "Sin baseline"
+                    ct28_avg = (float(w28["CT"].mean()) if not w28.empty else None)
 
-            updates.append((
-                # previas (sin partido)
-                CE7_pre, CS7_pre, CR7_pre, dias7_pre, CT7_pre,
-                # post/ACWR (incluye partido)
-                CE7_post, CS7_post, CR7_post, dias7_post, CT7_post,
-                CT28avg, acwr, acwr_pct, acwr, flag,
-                pid
-            ))
+                acwr_raw = (ct7 / ct28_avg) if (ct28_avg and ct28_avg > 0) else None
+                acwr_pct = (round(acwr_raw * 100.0, 1) if acwr_raw is not None else None)
+                acwr_flag = _cls(acwr_raw)
 
-        # --- Persistir
-        with self._conectar() as conn:
-            conn.executemany(
-                """UPDATE DB_Partidos
-                SET
-                    CE_prev7d_pre=?, CS_prev7d_pre=?, CR_prev7d_pre=?, dias_entreno_prev7d_pre=?, CT_7d_pre=?,
-                    CE_prev7d=?, CS_prev7d=?, CR_prev7d=?, dias_entreno_prev7d=?, CT_7d=?,
-                    CT_28d_avg=?, ACWR=?, ACWR_pct=?, ACWR_raw=?, ACWR_flag=?
-                WHERE id_partido=?""",
-                updates
-            )
-            conn.commit()
+                batch.append((
+                    ce7, cs7, cr7, ct7, ct28_avg, acwr_raw, acwr_pct, acwr_flag, int(r["id_partido"])
+                ))
+
+            con.executemany("""
+                UPDATE DB_Partidos
+                SET CE_prev7d  = ?,
+                    CS_prev7d  = ?,
+                    CR_prev7d  = ?,
+                    CT_7d      = ?,
+                    CT_28d_avg = ?,
+                    ACWR_raw   = ?,
+                    ACWR_pct   = ?,
+                    ACWR_flag  = ?
+                WHERE id_partido = ?
+            """, batch)
+            con.commit()
+            print(f"[OK] _actualizar_sobrecargas: partidos actualizados = {len(batch)}")
+            return len(batch)
+
 
     def refrescar_tabla_grupal(self, tabla_destino: str = "DB_Analisis_Grupal") -> None:
         """
@@ -2623,7 +2506,7 @@ class ETLChivas:
 # ============================================================
 
     def procesar_excel(self, ruta_xlsx: Path) -> dict:
-        resultado = {'entrenamientos': 0, 'partidos': 0, 'filas_rendimiento_semanal': 0}
+        resultado = {'entrenamientos': 0, 'partidos': 0}
         try:
             print(f"\n[INFO] Procesando archivo: {ruta_xlsx.name}")
 
@@ -2712,9 +2595,6 @@ class ETLChivas:
             # 9) Recalcular semanal solo si hubo entrenos nuevos
             if resultado['entrenamientos'] > 0:
                 ids_jugadores = entrenos['id_jugador'].dropna().unique().tolist()
-                n_semanal = self.recalcular_rendimiento_semanal(ids_jugadores)
-                resultado['filas_rendimiento_semanal'] = n_semanal
-                print(f"[DEBUG] Recalculado rendimiento semanal para {len(ids_jugadores)} jugadores")
             else:
                 print("[DEBUG] Salto recálculo semanal (no hubo nuevos entrenos).")
 
@@ -2728,7 +2608,7 @@ class ETLChivas:
             except Exception:
                 fecha_ref = None
 
-            if resultado.get('entrenamientos', 0) > 0 or resultado.get('filas_rendimiento_semanal', 0) > 0:
+            if resultado.get('entrenamientos', 0) > 0:
                 self._archivar_archivo(ruta_xlsx, "entrenamientos", fecha_ref)
 
             print(f"[SUCCESS] Archivo {ruta_xlsx.name} procesado: {resultado}")
@@ -2745,7 +2625,7 @@ class ETLChivas:
 
     def procesar_carpeta(self, carpeta_raw: Path) -> dict:
         carpeta_raw = Path(carpeta_raw)
-        totales = {"entrenamientos": 0, "partidos": 0, "filas_rendimiento_semanal": 0}
+        totales = {"entrenamientos": 0, "partidos": 0}
 
         # ⬇️ Barrer .xlsx y .xls
         archivos = []
@@ -3358,7 +3238,6 @@ class ETLChivas:
         return len(df)
 
 
-
     def _asegurar_campos_entrenamientos_para_microciclos(self):
         """
         Agrega columnas Microciclo_Num, Tipo_Microciclo, Fase, Tipo_Dia, Intensidad si faltan.
@@ -3500,6 +3379,137 @@ class ETLChivas:
             return con.total_changes
 
 
+    def etiquetar_microciclo(self):
+        with self._conectar() as con:
+            cur = con.cursor()
+
+            # 🔹 Asegurar columnas antes de actualizar
+            self._asegurar_campos_microciclo_global()
+
+            # 🔹 ENTRENAMIENTOS: etiquetar por fecha (respetando Auto_Descanso)
+            cur.execute("""
+            UPDATE DB_Entrenamientos AS e
+            SET Microciclo_Num  = (SELECT m.Microciclo_Num  FROM DB_MicrociclosExcel m WHERE m.Fecha = DATE(e.Fecha)),
+                Tipo_Microciclo = (SELECT m.Tipo_Microciclo FROM DB_MicrociclosExcel m WHERE m.Fecha = DATE(e.Fecha)),
+                Fase            = (SELECT m.Fase            FROM DB_MicrociclosExcel m WHERE m.Fecha = DATE(e.Fecha)),
+                Tipo_Dia        = COALESCE(
+                                        CASE WHEN COALESCE(e.Auto_Descanso,0)=1 THEN e.Tipo_Dia END,
+                                        (SELECT m.Tipo_Dia FROM DB_MicrociclosExcel m WHERE m.Fecha = DATE(e.Fecha))
+                                    ),
+                Intensidad      = COALESCE(
+                                        CASE WHEN COALESCE(e.Auto_Descanso,0)=1 THEN e.Intensidad END,
+                                        (SELECT m.Intensidad FROM DB_MicrociclosExcel m WHERE m.Fecha = DATE(e.Fecha))
+                                    )
+            WHERE EXISTS (SELECT 1 FROM DB_MicrociclosExcel m WHERE m.Fecha = DATE(e.Fecha));
+            """)
+
+            # 🔹 PARTIDOS: al menos Microciclo_Num
+            cur.execute("""
+            UPDATE DB_Partidos AS p
+            SET Microciclo_Num = (
+                        SELECT m.Microciclo_Num
+                        FROM DB_MicrociclosExcel m
+                        WHERE m.Fecha = DATE(p.Fecha)
+                    )
+            WHERE EXISTS (SELECT 1 FROM DB_MicrociclosExcel m WHERE m.Fecha = DATE(p.Fecha))
+            AND p.Microciclo_Num IS NULL;
+            """)
+
+            con.commit()
+        print("[OK] Microciclos etiquetados en ENTRENAMIENTOS y PARTIDOS.")
+
+
+    def _ensure_vw_microciclo_fechas(self, con):
+        con.executescript("""
+        CREATE VIEW IF NOT EXISTS vw_microciclo_fechas AS
+        SELECT
+        id_jugador,
+        Microciclo_Num,
+        DATE(MIN(Fecha)) AS Fecha_Inicio,
+        DATE(MAX(Fecha)) AS Fecha_Fin
+        FROM BI_Cargas_Diarias
+        WHERE Microciclo_Num IS NOT NULL
+        GROUP BY id_jugador, Microciclo_Num;
+        """)
+
+
+    def _backfill_agudo_cronico_acwr(self, con):
+        sql = """
+        WITH ref AS (
+        SELECT m.id_jugador, m.Microciclo_Num, f.Fecha_Fin AS fref
+        FROM DB_Microciclo m
+        JOIN vw_microciclo_fechas f USING (id_jugador, Microciclo_Num)
+        ),
+        d AS (
+        SELECT id_jugador,
+                DATE(Fecha) AS Fecha,
+                COALESCE(CT_dia, Carga_Explosiva + Carga_Sostenida + Carga_Regenerativa) AS CT_dia_f
+        FROM BI_Cargas_Diarias
+        ),
+        hist90 AS (
+        SELECT r.id_jugador, r.Microciclo_Num, r.fref,
+                AVG(d.CT_dia_f) AS ct90_daily
+        FROM ref r JOIN d
+            ON d.id_jugador=r.id_jugador
+        AND d.Fecha BETWEEN DATE(r.fref,'-89 day') AND DATE(r.fref,'-1 day')
+        GROUP BY 1,2,3
+        ),
+        w AS (
+        SELECT r.id_jugador, r.Microciclo_Num, r.fref,
+                SUM(CASE WHEN d.Fecha BETWEEN DATE(r.fref,'-6 day') AND r.fref THEN IFNULL(d.CT_dia_f,0) END) AS ct7,
+                AVG(d.CT_dia_f) AS ct28_daily,
+                SUM(CASE WHEN d.CT_dia_f IS NOT NULL THEN 1 END) AS n28
+        FROM ref r LEFT JOIN d
+            ON d.id_jugador=r.id_jugador
+        AND d.Fecha BETWEEN DATE(r.fref,'-27 day') AND r.fref
+        GROUP BY 1,2,3
+        ),
+        final AS (
+            SELECT
+                w.id_jugador,
+                w.Microciclo_Num,
+                w.ct7 AS carga_aguda,
+                CASE
+                    WHEN w.n28>=21 AND w.ct28_daily IS NOT NULL THEN w.ct28_daily*7
+                    WHEN w.n28 BETWEEN 10 AND 20 AND w.ct28_daily IS NOT NULL THEN w.ct28_daily*7
+                    WHEN (w.n28<10 OR w.ct28_daily IS NULL) AND h.ct90_daily IS NOT NULL THEN h.ct90_daily*7
+                    ELSE NULL
+                END AS carga_cronica,
+                CASE
+                    WHEN (CASE
+                            WHEN w.n28>=21 AND w.ct28_daily IS NOT NULL THEN w.ct28_daily*7
+                            WHEN w.n28 BETWEEN 10 AND 20 AND w.ct28_daily IS NOT NULL THEN w.ct28_daily*7
+                            WHEN (w.n28<10 OR w.ct28_daily IS NULL) AND h.ct90_daily IS NOT NULL THEN h.ct90_daily*7
+                            END) > 0
+                    THEN w.ct7 / (CASE
+                                    WHEN w.n28>=21 AND w.ct28_daily IS NOT NULL THEN w.ct28_daily*7
+                                    WHEN w.n28 BETWEEN 10 AND 20 AND w.ct28_daily IS NOT NULL THEN w.ct28_daily*7
+                                    WHEN (w.n28<10 OR w.ct28_daily IS NULL) AND h.ct90_daily IS NOT NULL THEN h.ct90_daily*7
+                                    END)
+                END AS acwr,
+                w.n28 AS n28_cobertura,                         -- <<<<< este alias
+                CASE
+                    WHEN w.n28>=21 AND w.ct28_daily IS NOT NULL THEN 0
+                    WHEN w.n28 BETWEEN 10 AND 20 AND w.ct28_daily IS NOT NULL THEN 1
+                    WHEN (w.n28<10 OR w.ct28_daily IS NULL) AND h.ct90_daily IS NOT NULL THEN 2
+                    ELSE 3
+                END AS cronica_fallback_flag
+            FROM w LEFT JOIN hist90 h
+                ON h.id_jugador=w.id_jugador AND h.Microciclo_Num=w.Microciclo_Num
+            )
+        UPDATE DB_Microciclo AS m
+        SET
+            carga_aguda_entreno   = (SELECT f.carga_aguda          FROM final f WHERE f.id_jugador=m.id_jugador AND f.Microciclo_Num=m.Microciclo_Num),
+            carga_cronica_entreno = (SELECT f.carga_cronica        FROM final f WHERE f.id_jugador=m.id_jugador AND f.Microciclo_Num=m.Microciclo_Num),
+            acwr_entreno          = (SELECT f.acwr                 FROM final f WHERE f.id_jugador=m.id_jugador AND f.Microciclo_Num=m.Microciclo_Num),
+            acwr_pct_entreno      = (SELECT CASE WHEN f.acwr IS NOT NULL THEN 100.0*f.acwr END
+                                                FROM final f WHERE f.id_jugador=m.id_jugador AND f.Microciclo_Num=m.Microciclo_Num),
+            n28_cobertura         = (SELECT f.n28_cobertura        FROM final f WHERE f.id_jugador=m.id_jugador AND f.Microciclo_Num=m.Microciclo_Num),  -- <<<<< antes decía f.n28
+            cronica_fallback_flag = (SELECT f.cronica_fallback_flag FROM final f WHERE f.id_jugador=m.id_jugador AND f.Microciclo_Num=m.Microciclo_Num);
+        """
+        con.executescript(sql)
+
+
     def actualizar_db_entrenamientos(self):
         self._asegurar_campos_entrenamientos_para_microciclos()
         self._anotar_microciclo_en_entrenamientos_existentes()
@@ -3560,6 +3570,300 @@ class ETLChivas:
             GROUP BY id_jugador, Microciclo_Num
             """)
         print("[OK] DB_Microciclo creada/actualizada.")
+
+
+    def crear_vista_microciclo_total(self):
+        """
+        Crea/repone la vista vw_Microciclo_Total que agrega ENTRENOS + PARTIDOS por (id_jugador, Microciclo_Num).
+        Detecta dinámicamente las métricas comunes y las suma.
+        """
+        with self._conectar() as con:
+            # columnas disponibles
+            cols_ent = {r[1] for r in con.execute("PRAGMA table_info(DB_Entrenamientos)")}
+            cols_par = {r[1] for r in con.execute("PRAGMA table_info(DB_Partidos)")}
+
+            # métricas candidatas (agregables). Poné acá las que te interesan sumar.
+            candidatas = [
+                "Distancia_total","HSR_abs_m","HMLD_m",
+                "Sprints_distancia_m","Sprints_cantidad","Sprints_vel_max_kmh",
+                "Acc_3","Dec_3",
+                "Player_Load","RPE",
+                "Carga_Explosiva","Carga_Sostenida","Carga_Regenerativa",
+                "Rendimiento_Diario","HSR_rel_m","Velocidad_prom_m_min"
+            ]
+            comunes = [c for c in candidatas if c in cols_ent and c in cols_par]
+
+            # Si no hay comunes, igual creamos la vista con un dummy
+            if not comunes:
+                comunes = []
+
+            # SELECT de entrenos
+            ent_select = [
+                "e.id_jugador AS id_jugador",
+                "e.Microciclo_Num AS Microciclo_Num"
+            ] + [f"COALESCE(e.{c},0) AS {c}" for c in comunes]
+
+            # SELECT de partidos
+            par_select = [
+                "p.id_jugador AS id_jugador",
+                "p.Microciclo_Num AS Microciclo_Num"
+            ] + [f"COALESCE(p.{c},0) AS {c}" for c in comunes]
+
+            union_cols = ["id_jugador","Microciclo_Num"] + comunes
+
+            # Agregación final
+            sum_expr = ",\n       ".join([f"SUM({c}) AS {c}" for c in comunes]) if comunes else "0 AS dummy"
+
+            con.execute("DROP VIEW IF EXISTS vw_Microciclo_Total")
+            sql = f"""
+            CREATE VIEW vw_Microciclo_Total AS
+            SELECT id_jugador, Microciclo_Num,
+                {sum_expr}
+            FROM (
+                SELECT {", ".join(ent_select)}
+                FROM DB_Entrenamientos e
+                WHERE e.Microciclo_Num IS NOT NULL
+
+                UNION ALL
+
+                SELECT {", ".join(par_select)}
+                FROM DB_Partidos p
+                WHERE p.Microciclo_Num IS NOT NULL
+            ) t
+            GROUP BY id_jugador, Microciclo_Num
+            """
+            con.execute(sql)
+        print("[OK] Vista vw_Microciclo_Total creada (ENTRENOS + PARTIDOS).")
+
+
+    def _asegurar_campos_microciclo_global(self):
+        """
+        Garantiza que existan las columnas necesarias para etiquetar microciclos
+        tanto en DB_Entrenamientos como en DB_Partidos.
+        - Entrenamientos: Microciclo_Num, Tipo_Microciclo, Fase, Tipo_Dia, Intensidad
+        - Partidos: al menos Microciclo_Num (podés sumar Tipo_Microciclo/Fase si querés)
+        """
+        cols_entrenos = {
+            "Microciclo_Num": "INTEGER",
+            "Tipo_Microciclo": "TEXT",
+            "Fase": "TEXT",
+            "Tipo_Dia": "TEXT",
+            "Intensidad": "REAL",
+        }
+        cols_partidos = {
+            "Microciclo_Num": "INTEGER",
+            # Si querés también:
+            # "Tipo_Microciclo": "TEXT",
+            # "Fase": "TEXT",
+        }
+        with self._conectar() as con:
+            # Entrenamientos
+            ent_cols = {r[1] for r in con.execute("PRAGMA table_info(DB_Entrenamientos)")}
+            for c, t in cols_entrenos.items():
+                if c not in ent_cols:
+                    con.execute(f"ALTER TABLE DB_Entrenamientos ADD COLUMN {c} {t}")
+
+            # Partidos
+            par_cols = {r[1] for r in con.execute("PRAGMA table_info(DB_Partidos)")}
+            for c, t in cols_partidos.items():
+                if c not in par_cols:
+                    con.execute(f"ALTER TABLE DB_Partidos ADD COLUMN {c} {t}")
+
+            # Índices útiles por fecha
+            con.execute("CREATE INDEX IF NOT EXISTS idx_entr_fecha ON DB_Entrenamientos(Fecha)")
+            con.execute("CREATE INDEX IF NOT EXISTS idx_part_fecha ON DB_Partidos(Fecha)")
+            con.execute("CREATE INDEX IF NOT EXISTS idx_micr_fecha ON DB_MicrociclosExcel(Fecha)")
+
+
+    def publicar_bi_microciclo_total(self):
+        """
+        (Re)crea BI_Microciclo_Total:
+        - suma métricas de ENTRENOS + PARTIDOS por (id_jugador, Microciclo_Num)
+        - añade sobrecarga por microciclo:
+            * carga_aguda  = carga del microciclo actual
+            * carga_cronica= promedio de los últimos 3 microciclos previos (del mismo jugador)
+            * acwr         = aguda / crónica
+            * acwr_pct     = (acwr - 1) * 100
+        Sin ventanas: máxima compatibilidad con conectores.
+        """
+        with self._conectar() as con:
+            cur = con.cursor()
+
+            # --- detectar columnas de métricas a sumar (presentes en ambas tablas) ---
+            cols_ent = {r[1]: r[2] for r in cur.execute("PRAGMA table_info(DB_Entrenamientos)")}
+            cols_par = {r[1]: r[2] for r in cur.execute("PRAGMA table_info(DB_Partidos)")}
+            candidatas = [
+                "Carga_Total","Carga_Total_Total","Player_Load","RPE",
+                "Distancia_total","HSR_abs_m","HMLD_m",
+                "Sprints_distancia_m","Sprints_cantidad","Sprints_vel_max_kmh",
+                "Acc_3","Dec_3","HSR_rel_m","Velocidad_prom_m_min",
+                "Carga_Explosiva","Carga_Sostenida","Carga_Regenerativa",
+                "Rendimiento_Diario"
+            ]
+            comunes = [c for c in candidatas if c in cols_ent and c in cols_par]
+            if not comunes:
+                comunes = ["Carga_Total"] if "Carga_Total" in cols_ent and "Carga_Total" in cols_par else []
+
+            # columna "driver" para calcular ACWR (prioridad)
+            driver = next((c for c in ["Carga_Total","Carga_Total_Total","Player_Load"] if c in comunes), None)
+
+            # --- construir SQL dinámico ---
+            sel_ent = ", ".join([f"COALESCE(e.{c},0) AS {c}" for c in comunes]) or "0 AS dummy"
+            sel_par = ", ".join([f"COALESCE(p.{c},0) AS {c}" for c in comunes]) or "0 AS dummy"
+            sum_expr = ", ".join([f"SUM({c}) AS {c}" for c in comunes]) or "SUM(dummy) AS dummy"
+
+            cur.executescript(f"""
+            DROP TABLE IF EXISTS BI_Microciclo_Total;
+            DROP VIEW  IF EXISTS _union_total;
+            DROP VIEW  IF EXISTS _agg_total;
+
+            CREATE TEMP VIEW _union_total AS
+            SELECT e.id_jugador AS id_jugador,
+                e.Microciclo_Num AS Microciclo_Num,
+                {sel_ent}
+            FROM DB_Entrenamientos e
+            WHERE e.Microciclo_Num IS NOT NULL
+            UNION ALL
+            SELECT p.id_jugador,
+                p.Microciclo_Num,
+                {sel_par}
+            FROM DB_Partidos p
+            WHERE p.Microciclo_Num IS NOT NULL;
+
+            CREATE TEMP VIEW _agg_total AS
+            SELECT id_jugador, Microciclo_Num,
+                {sum_expr}
+            FROM _union_total
+            GROUP BY id_jugador, Microciclo_Num;
+
+            CREATE TABLE BI_Microciclo_Total AS
+            SELECT * FROM _agg_total;
+            """)
+
+            # --- añadir columnas de sobrecarga (si tenemos columna driver) ---
+            if driver:
+                cur.executescript(f"""
+                ALTER TABLE BI_Microciclo_Total ADD COLUMN carga_aguda   REAL;
+                ALTER TABLE BI_Microciclo_Total ADD COLUMN carga_cronica REAL;
+                ALTER TABLE BI_Microciclo_Total ADD COLUMN acwr          REAL;
+                ALTER TABLE BI_Microciclo_Total ADD COLUMN acwr_pct      REAL;
+
+                UPDATE BI_Microciclo_Total
+                SET carga_aguda = COALESCE({driver},0);
+
+                UPDATE BI_Microciclo_Total AS t
+                SET carga_cronica = (
+                    SELECT AVG(t2.{driver})
+                        FROM BI_Microciclo_Total t2
+                        WHERE t2.id_jugador = t.id_jugador
+                        AND t2.Microciclo_Num BETWEEN t.Microciclo_Num - 3 AND t.Microciclo_Num - 1
+                );
+
+                UPDATE BI_Microciclo_Total
+                SET acwr = CASE WHEN carga_cronica>0 THEN carga_aguda*1.0/carga_cronica END,
+                    acwr_pct = CASE WHEN carga_cronica>0 THEN (carga_aguda*1.0/carga_cronica - 1)*100 END;
+                """)
+
+            # índices útiles para PBI
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_bi_mic_total ON BI_Microciclo_Total(id_jugador, Microciclo_Num);")
+
+            con.commit()
+        print("[OK] BI_Microciclo_Total (sumas + sobrecarga) publicada.")
+
+
+    def publicar_bi_cargas_diarias(self):
+        with self._conectar() as con:
+            cur = con.cursor()
+
+            cols_ent = {r[1] for r in cur.execute("PRAGMA table_info(DB_Entrenamientos)")}
+            cols_par = {r[1] for r in cur.execute("PRAGMA table_info(DB_Partidos)")}
+
+            # +++ añadimos las 3 cargas base + lo demás que ya mostrabas +++
+            candidatas = [
+                "Carga_Explosiva", "Carga_Sostenida", "Carga_Regenerativa",
+                "Player_Load", "RPE",
+                "Distancia_total", "HSR_abs_m", "HMLD_m",
+                "Sprints_distancia_m", "Sprints_cantidad", "Sprints_vel_max_kmh",
+                "Acc_3", "Dec_3"
+            ]
+
+            def build_select(alias, cols_present):
+                parts = []
+                for c in candidatas:
+                    parts.append(f"COALESCE({alias}.{c},0) AS {c}" if c in cols_present else f"0 AS {c}")
+                return ", ".join(parts)
+
+            sel_ent = build_select("e", cols_ent)
+            sel_par = build_select("p", cols_par)
+
+            cur.executescript(f"""
+            DROP TABLE IF EXISTS BI_Cargas_Diarias;
+
+            CREATE TABLE BI_Cargas_Diarias AS
+            -- ENTRENAMIENTOS (incluye ENTRENO y DESCANSO)
+            SELECT 
+                e.id_jugador,
+                DATE(e.Fecha) AS Fecha,
+                e.Tipo_Dia,
+                0 AS EsPartido,
+                e.Microciclo_Num,
+                {sel_ent}
+            FROM DB_Entrenamientos e
+
+            UNION ALL
+
+            -- PARTIDOS
+            SELECT 
+                p.id_jugador,
+                DATE(p.Fecha) AS Fecha,
+                'PARTIDO' AS Tipo_Dia,
+                1 AS EsPartido,
+                p.Microciclo_Num, 
+                {sel_par}
+            FROM DB_Partidos p;
+            """)
+
+            # CT_dia = CE + CS + CR (con 0 si falta)
+            cur.executescript("""
+            ALTER TABLE BI_Cargas_Diarias ADD COLUMN CT_dia REAL;
+            UPDATE BI_Cargas_Diarias
+            SET CT_dia = COALESCE(Carga_Explosiva,0)
+                        + COALESCE(Carga_Sostenida,0)
+                        + COALESCE(Carga_Regenerativa,0);
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_bi_diario ON BI_Cargas_Diarias(id_jugador, Fecha, Microciclo_Num);")
+            con.commit()
+        print("[OK] BI_Cargas_Diarias publicada con CT_dia (CE+CS+CR).")
+
+
+    def actualizar_sobrecarga_en_db_microciclo(self):
+        """Orquesta: asegura columnas/viste y corre el backfill 7d/28d."""
+        with self._conectar() as con:
+            cur = con.cursor()
+
+            # Asegurar columnas de destino (puede existir la tabla sin estas cols)
+            cur.execute("PRAGMA table_info(DB_Microciclo)")
+            cols = {r[1] for r in cur.fetchall()}
+
+            def ensure(col, typ):
+                if col not in cols:
+                    cur.execute(f"ALTER TABLE DB_Microciclo ADD COLUMN {col} {typ}")
+
+            ensure("carga_aguda_entreno",   "REAL")
+            ensure("carga_cronica_entreno", "REAL")
+            ensure("acwr_entreno",          "REAL")
+            ensure("acwr_pct_entreno",      "REAL")
+            # opcional (útil para debug/QA):
+            ensure("n28_cobertura",         "INTEGER")
+            ensure("cronica_fallback_flag", "INTEGER")
+
+            # Vista de fechas
+            self._ensure_vw_microciclo_fechas(con)
+            # Backfill robusto 7d/28d
+            self._backfill_agudo_cronico_acwr(con)
+
+            con.commit()
+        print("[OK] ACWR recalculado (7d/28d, con fallback) en DB_Microciclo.")
 
 
 
