@@ -67,6 +67,9 @@ def main():
     etl.publicar_bi_microciclo_total()
     etl.publicar_bi_cargas_diarias()
 
+    # 8️⃣ Predicciones de riesgo de sobrecarga (ML)
+    etl.actualizar_predicciones_sobrecarga()
+
     # 🔟 Consolidar rivales
     try:
         import gc; gc.collect(); time.sleep(2)

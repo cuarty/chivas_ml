@@ -3990,6 +3990,40 @@ class ETLChivas:
             return 0
 
 
+    # ============================================================
+    # 22- MODELO ML: Predicción de riesgo de sobrecarga
+    # ============================================================
+
+    def actualizar_predicciones_sobrecarga(self):
+        """
+        Ejecuta el modelo de ML de sobrecarga importando la función desde
+        src/ml/inference/predict_overload.py
+        """
+        import pandas as pd
+        import sqlite3
+        from src.chivas_ml.ml.inference.predict_overload import predecir_riesgo
+
+        print("\n[INFO] Ejecutando modelo de ML - Riesgo de Sobrecarga...")
+
+        conn = sqlite3.connect("C:/Users/Nico/Desktop/DATA SCIENCE/PP- VOLUNTAREADO/chivas-ml/data/external/chivas_dw.sqlite")
+        df = pd.read_sql_query("SELECT * FROM vw_cargas_rolling_7d_full", conn)
+
+        if df.empty:
+            print("[WARN] No hay datos para predecir riesgo de sobrecarga.")
+            conn.close()
+            return
+
+        # Llamar a la función del script predict_overload.py
+        df_pred = predecir_riesgo(df)
+
+        # Guardar resultados
+        df_pred.to_sql("ML_Sugeridos_Sobrecarga", conn, if_exists="replace", index=False)
+        conn.close()
+
+        print("[OK] Tabla 'ML_Sugeridos_Sobrecarga' actualizada correctamente.")
 
 
 
+        
+       
+        
