@@ -77,19 +77,29 @@ def predecir_riesgo(df_actual=None):
 
     # 💧 Suavizado temporal de probabilidades
     df_actual = df_actual.sort_values(['id_jugador', 'Fecha'])
-    df_actual['prob_riesgo_suavizado'] = (
+
+    # 🔹 Suavizado operativo (3 días)
+    df_actual['prob_riesgo_suavizado_3d'] = (
         df_actual.groupby('id_jugador')['prob_riesgo']
-        .transform(lambda x: x.rolling(3, min_periods=1).mean())
+        .transform(lambda x: x.shift(1).rolling(window=2, min_periods=1).mean())
     )
+
+    # 🔹 Suavizado estratégico (5 días)
+    df_actual['prob_riesgo_suavizado_5d'] = (
+        df_actual.groupby('id_jugador')['prob_riesgo']
+        .transform(lambda x: x.shift(1).rolling(window=4, min_periods=1).mean())
+    )
+
+
 
     # Definir niveles con la probabilidad suavizada
     # Definir condiciones SOLO sobre las filas válidas
     df_validas = df_actual.loc[mask_validas].copy()
 
     condiciones_validas = [
-        (df_validas['prob_riesgo_suavizado'] < 0.45),
-        (df_validas['prob_riesgo_suavizado'] >= 0.45) & (df_validas['prob_riesgo_suavizado'] < 0.75),
-        (df_validas['prob_riesgo_suavizado'] >= 0.75)
+        (df_validas['prob_riesgo_suavizado_3d'] < 0.45),
+        (df_validas['prob_riesgo_suavizado_3d'] >= 0.45) & (df_validas['prob_riesgo_suavizado_3d'] < 0.75),
+        (df_validas['prob_riesgo_suavizado_3d'] >= 0.75)
     ]
     categorias = ['Bajo', 'Medio', 'Alto']
 
@@ -101,7 +111,7 @@ def predecir_riesgo(df_actual=None):
     # 🔹 Tabla de salida
     # =============================================
     df_salida = df_actual[['id_jugador', 'Fecha',
-                           'prob_riesgo', 'prob_riesgo_suavizado',
+                           'prob_riesgo', 'prob_riesgo_suavizado_3d', 'prob_riesgo_suavizado_5d',
                            'riesgo_pred', 'nivel_riesgo']]
 
     print("✅ Predicciones de riesgo suavizadas y generadas correctamente.")
