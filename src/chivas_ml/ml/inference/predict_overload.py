@@ -16,8 +16,8 @@ def predecir_riesgo(df_actual=None):
     # 🔹 Rutas de modelo y base
     # =============================================
     
-    model_path = Path('C:/Users/Nico/Desktop/DATA SCIENCE/PP- VOLUNTAREADO/chivas-ml/src/chivas_ml/ml/registry/model_overload_rf.pkl')
-    scaler_path = Path('C:/Users/Nico/Desktop/DATA SCIENCE/PP- VOLUNTAREADO/chivas-ml/src/chivas_ml/ml/registry/scaler_overload.pkl')
+    model_path = Path('C:/Users/Nico/Desktop/DATA SCIENCE/PP- VOLUNTAREADO/chivas-ml/src/chivas_ml/ml/registry/modelo_predecir_riesgo/model_overload_rf.pkl')
+    scaler_path = Path('C:/Users/Nico/Desktop/DATA SCIENCE/PP- VOLUNTAREADO/chivas-ml/src/chivas_ml/ml/registry/modelo_predecir_riesgo/scaler_overload.pkl')
     db_path = Path('C:/Users/Nico/Desktop/DATA SCIENCE/PP- VOLUNTAREADO/chivas-ml/data/external/chivas_dw.sqlite')
 
 
