@@ -12,6 +12,7 @@ from src.chivas_ml.utils import (
     procesar_partidos_dir,
 )
 
+
 def main():
     # 🔹 Limpiar conexiones previas
     db_path = Path("data/external/chivas_dw.sqlite")
@@ -27,7 +28,6 @@ def main():
     rutas = configurar_rutas()
     etl = inicializar_etl(rutas)
     mostrar_encabezados(rutas['RAW_ENTRENAMIENTOS'], rutas['RAW_PARTIDOS'])
-
     # 1️⃣ Jugadores y calendario
     etl.cargar_calendario_partidos(rutas['CAL_PARTIDOS'])
     if not cargar_jugadores(etl, rutas['JUGADORES_XLSX']):
@@ -69,6 +69,9 @@ def main():
 
     # 8️⃣ Predicciones de riesgo de sobrecarga (ML)
     etl.actualizar_predicciones_sobrecarga()
+    
+    # 8️⃣ Predicciones de cargas (ML)
+    etl.predecir_microciclo()
 
     # 🔟 Consolidar rivales
     try:

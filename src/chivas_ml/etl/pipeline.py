@@ -136,6 +136,7 @@ from fuzzywuzzy import fuzz, process
 from datetime import datetime
 import shutil
 import time
+from src.chivas_ml.ml.inference.predict_microciclo import ejecutar_prediccion_microciclo
 
 
 
@@ -4022,6 +4023,18 @@ class ETLChivas:
 
         print("[OK] Tabla 'ML_Sugeridos_Sobrecarga' actualizada correctamente.")
 
+
+    # ======================================================
+    # 23 - MODELO ML: Predicción de microciclo (semanal)
+    # ======================================================
+    
+    def predecir_microciclo(self):
+        print("\n🔮 Iniciando predicción del próximo microciclo...\n")
+        from src.chivas_ml.ml.inference.predict_microciclo import ejecutar_prediccion_microciclo
+
+        df_predicciones = ejecutar_prediccion_microciclo()
+        print("✅ Predicciones del microciclo generadas correctamente.")
+        return df_predicciones
 
 
         
