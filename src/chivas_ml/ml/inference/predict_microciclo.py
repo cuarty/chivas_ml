@@ -1,4 +1,3 @@
-
 # ================================================
 # 🔮 PREDICCIÓN DEL PRÓXIMO MICROCICLO (FINAL)
 # ================================================
@@ -42,9 +41,12 @@ def obtener_microciclo_completo(conn):
 # 🧱 Preparar datos de entrada
 # ================================================
 def preparar_datos(conn):
+    # 1️⃣ Detectar último microciclo completo
     microciclo_actual = obtener_microciclo_completo(conn)
+    microciclo_next = microciclo_actual + 1
     print(f"📆 Último microciclo completo detectado: {microciclo_actual}")
 
+    # 2️⃣ Cargar vista base
     query = f"""
         SELECT *
         FROM vw_predicciones_diarias_extendida
@@ -52,33 +54,133 @@ def preparar_datos(conn):
     """
     df = pd.read_sql(query, conn)
     print(f"[OK] Datos cargados desde vw_predicciones_diarias_extendida ({len(df)} filas).")
-    print("Columnas disponibles:", list(df.columns))
 
-    # ============================================
-    # 🧠 CONTEXTO FISIOLÓGICO: jugador + posición
-    # ============================================
-    df['Posicion'] = df['Posicion'].fillna('Desconocido')
-    df['Linea'] = df['Linea'].fillna('Desconocido')
+    # 3️⃣ Cargar planificación del microciclo siguiente
+    query_plan = f"""
+        SELECT Fecha, Tipo_Dia, Intensidad, Microciclo_Num
+        FROM DB_MicrociclosExcel
+        WHERE Microciclo_Num = {microciclo_next}
+        ORDER BY Fecha
+    """
+    df_plan = pd.read_sql(query_plan, conn)
+    df_plan["Fecha"] = pd.to_datetime(df_plan["Fecha"]).dt.normalize()
+    if df_plan.empty:
+        raise ValueError(f"⚠️ No hay planificación para el microciclo {microciclo_next}")
 
-    player_mean = df.groupby('id_jugador').agg({
-        'Distancia_total': 'mean',
-        'Player_Load': 'mean',
-        'Acc_3': 'mean',
-        'Dec_3': 'mean'
+    # 4️⃣ Mapear tipo_dia_next con la misma codificación usada en entrenamiento
+    def map_tipo_dia_next(row):
+        if row["Tipo_Dia"].upper() == "DESCANSO":
+            return 0
+        elif row["Tipo_Dia"].upper() == "ENTRENO":
+            if row["Intensidad"] <= -2:
+                return 1   # muy suave
+            elif row["Intensidad"] == -1:
+                return 2   # medio-bajo
+            elif row["Intensidad"] == 1:
+                return 3   # medio-alto
+            elif row["Intensidad"] >= 2:
+                return 4   # alta carga
+            else:
+                return 2
+        elif row["Tipo_Dia"].upper() == "PARTIDO":
+            return 0
+        else:
+            return 0
+
+    df_plan["tipo_dia_next"] = df_plan.apply(map_tipo_dia_next, axis=1).astype(float)
+
+    # 5️⃣ Contexto fisiológico del jugador
+    df["Posicion"] = df["Posicion"].fillna("Desconocido")
+    df["Linea"] = df["Linea"].fillna("Desconocido")
+
+    player_mean = df.groupby("id_jugador").agg({
+        "Distancia_total": "mean",
+        "Player_Load": "mean",
+        "Acc_3": "mean",
+        "Dec_3": "mean"
     }).rename(columns={
-        'Distancia_total': 'jugador_mean_dist',
-        'Player_Load': 'jugador_mean_load',
-        'Acc_3': 'jugador_mean_acc',
-        'Dec_3': 'jugador_mean_dec'
+        "Distancia_total": "jugador_mean_dist",
+        "Player_Load": "jugador_mean_load",
+        "Acc_3": "jugador_mean_acc",
+        "Dec_3": "jugador_mean_dec"
     }).reset_index()
 
-    df = df.merge(player_mean, on='id_jugador', how='left')
-    df = pd.get_dummies(df, columns=['Posicion', 'Linea'], prefix=['Pos', 'Lin'])
+    df = df.merge(player_mean, on="id_jugador", how="left")
+    df = pd.get_dummies(df, columns=["Posicion", "Linea"], prefix=["Pos", "Lin"])
 
-    print("✅ Nuevas columnas añadidas:",
-          [c for c in df.columns if c.startswith('Pos_') or c.startswith('Lin_')])
+        # 💡 Asegurar todas las columnas dummy que existían en el entrenamiento
+    columnas_esperadas = [
+        "Pos_Defensor", "Pos_Delantero", "Pos_Mediocampista",
+        "Lin_Defensa Central", "Lin_Defensa Lateral", "Lin_Delantera",
+        "Lin_Extremo", "Lin_Medio Defensivo", "Lin_Medio Ofensivo"
+    ]
 
-    return df, microciclo_actual
+    for col in columnas_esperadas:
+        if col not in df.columns:
+            df[col] = 0.0  # agregamos columna dummy faltante
+
+    print("✅ Columnas dummy normalizadas (todas las posiciones y líneas presentes).")
+
+
+    # 🧹 Asegurar formato de fecha y eliminar duplicados
+    if "Fecha" not in df.columns:
+        for col in ["Fecha_x", "Fecha_y"]:
+            if col in df.columns:
+                df.rename(columns={col: "Fecha"}, inplace=True)
+    df["Fecha"] = pd.to_datetime(df["Fecha"]).dt.normalize()
+
+    # 🧩 Eliminar duplicados de la vista base (una fila por jugador y fecha)
+    numeric_cols = df.select_dtypes(include=["number"]).columns
+    df = df.groupby(["id_jugador", "Fecha"], as_index=False)[numeric_cols].mean(numeric_only=True)
+    print(f"🧩 Agrupado df base: {len(df)} filas únicas (1 por jugador y día).")
+
+    # 6️⃣ Crear estructura jugador × fecha del microciclo siguiente
+    jugadores = df["id_jugador"].unique()
+    fechas_plan = df_plan["Fecha"].unique()
+    grid = pd.MultiIndex.from_product([jugadores, fechas_plan], names=["id_jugador", "Fecha"]).to_frame(index=False)
+
+    # 7️⃣ Combinar planificación e info de jugadores
+    df_next = grid.merge(df_plan, on="Fecha", how="left")
+    df_next = df_next.merge(df.drop(columns=["Fecha"]), on="id_jugador", how="left")
+
+    # 🧹 Unificar columnas duplicadas (_x / _y)
+    for col in ["Tipo_Dia", "tipo_dia_next"]:
+        cols_posibles = [c for c in df_next.columns if c.startswith(col)]
+        if len(cols_posibles) > 1:
+            df_next[col] = df_next[cols_posibles].bfill(axis=1).iloc[:, 0]
+            df_next.drop(columns=[c for c in cols_posibles if c != col], inplace=True)
+        elif len(cols_posibles) == 1:
+            df_next.rename(columns={cols_posibles[0]: col}, inplace=True)
+        else:
+            df_next[col] = None
+
+    # 8️⃣ Asignar microciclos
+    df_next["microciclo_actual"] = microciclo_actual
+    df_next["microciclo_next"] = microciclo_next
+
+    # 9️⃣ Aplicar factor de intensidad diaria a features fisiológicos
+    if "tipo_dia_next" in df_next.columns:
+        intensidad_factor = df_next["tipo_dia_next"]
+        for col in [
+            "CT_total_actual", "CE_total_actual", "CS_total_actual", "CR_total_actual",
+            "jugador_mean_dist", "jugador_mean_load", "jugador_mean_acc", "jugador_mean_dec"
+        ]:
+            if col in df_next.columns:
+                df_next[col] = df_next[col] * (1 + 0.1 * intensidad_factor)
+        print("🧠 Intensidad diaria aplicada a features de entrada.")
+    else:
+        print("⚠️ No se aplicó ajuste de intensidad (columna tipo_dia_next ausente).")
+
+    # 🔹 Asegurar una sola fila por jugador y fecha (por si se duplica en merges)
+    df_next = df_next.groupby(["id_jugador", "Fecha"], as_index=False).first()
+
+    # 10️⃣ Mostrar resumen de columnas clave
+    print(f"Columnas finales disponibles: {list(df_next.columns)}")
+    print(f"📆 Fechas únicas detectadas: {df_next['Fecha'].nunique()}")
+    print(df_next[["Fecha", "Tipo_Dia", "tipo_dia_next"]].drop_duplicates().sort_values("Fecha").head(10))
+    print("✅ Datos de entrada listos para el pipeline de predicción.")
+
+    return df_next, microciclo_actual
 
 
 # ================================================
@@ -86,6 +188,7 @@ def preparar_datos(conn):
 # ================================================
 def predict_pipeline(df):
     print("🚀 Iniciando flujo de predicción jerárquica...\n")
+    fecha_original = df["Fecha"].copy()  # 💡 guardamos la columna para restaurarla después
 
     # 1️⃣ Predicción tipo de semana
     folder = "modelo_clas_carga_semanal"
@@ -122,16 +225,21 @@ def predict_pipeline(df):
         'jugador_mean_dist', 'jugador_mean_load', 'jugador_mean_acc', 'jugador_mean_dec'
     ] + [c for c in df.columns if c.startswith('Pos_') or c.startswith('Lin_')]
 
-    # 🔧 Solo tomamos las columnas que realmente existen en df
     X_dist = df[[c for c in FEATURES_DIST if c in df.columns]].copy()
-
-    # 🧹 Eliminamos posibles duplicados o columnas que no estaban en el fit
     if 'tipo_semana_pred' in X_dist.columns:
         X_dist = X_dist.drop(columns=['tipo_semana_pred'])
 
+    # 🔧 Compatibilidad total con el scaler
+    expected_cols = list(scaler.feature_names_in_)
+    for c in expected_cols:
+        if c not in X_dist.columns:
+            X_dist[c] = 0.0
+    X_dist = X_dist[expected_cols]
+
+    print(f"✅ Columnas ajustadas al scaler ({len(expected_cols)} features).")
+
     df["Distancia_total_pred"] = model.predict(scaler.transform(X_dist))
     print("✅ Distancia total predicha")
-
 
     # 3️⃣ Predicción Carga Explosiva y Sostenida
     for name, folder, m, s in [
@@ -140,7 +248,6 @@ def predict_pipeline(df):
     ]:
         model, scaler = load_model(os.path.join(REGISTRY_DIR, folder), m, s)
 
-        # 🧩 Compatibilidad con nombres de entrenamiento
         df["tipo_semana_next"] = df["tipo_semana_pred"]
         df["Distancia_total"] = df["Distancia_total_pred"]
 
@@ -154,19 +261,24 @@ def predict_pipeline(df):
         ] + [c for c in df.columns if c.startswith('Pos_') or c.startswith('Lin_')]
 
         X_cargas = df[[c for c in FEATURES_CARGAS if c in df.columns]].copy()
-
-        # 🧹 Eliminar duplicados si existen
         for col in ['tipo_semana_pred', 'Distancia_total_pred']:
             if col in X_cargas.columns:
                 X_cargas = X_cargas.drop(columns=[col])
 
+        # 🔧 Ajustar columnas al scaler dentro del bucle
+        expected_cols = list(scaler.feature_names_in_)
+        for c in expected_cols:
+            if c not in X_cargas.columns:
+                X_cargas[c] = 0.0
+        X_cargas = X_cargas[expected_cols]
+
         df[f"{name}_pred"] = model.predict(scaler.transform(X_cargas))
+        print(f"✅ {name} predicho con {len(expected_cols)} features validados.")
+
     print("✅ Cargas CE y CS predichas")
 
     # 4️⃣ Predicción de métricas micro (Acc, Dec, HMLD, HSR, Sprint)
     print("🔄 Iniciando predicción de métricas micro...")
-
-    # 🔄 Compatibilidad con nombres esperados por los modelos
     df["tipo_semana_next"] = df["tipo_semana_pred"]
     df["Distancia_total"] = df["Distancia_total_pred"]
     df["Carga_Explosiva"] = df["CE_pred"]
@@ -193,91 +305,112 @@ def predict_pipeline(df):
         ] + [c for c in df.columns if c.startswith('Pos_') or c.startswith('Lin_')]
 
         X_micro = df[[c for c in FEATURES_MICRO if c in df.columns]].copy()
-
-        # 🧹 Eliminar columnas que no estaban en el fit
         for col_drop in ['tipo_semana_pred', 'Distancia_total_pred', 'CE_pred', 'CS_pred']:
             if col_drop in X_micro.columns:
                 X_micro = X_micro.drop(columns=[col_drop])
 
+        # 🔧 Ajustar columnas al scaler dentro del bucle
+        expected_cols = list(scaler.feature_names_in_)
+        for c in expected_cols:
+            if c not in X_micro.columns:
+                X_micro[c] = 0.0
+        X_micro = X_micro[expected_cols]
+
         df[f"{col}_pred"] = model.predict(scaler.transform(X_micro))
+        print(f"✅ {col} predicho correctamente ({len(expected_cols)} features validados).")
 
     print("✅ Métricas micro predichas correctamente")
 
+    # 💾 Restaurar columna de fecha para análisis temporal
+    if "Fecha" not in df.columns:
+        df["Fecha"] = fecha_original
+    print("📅 Columna Fecha preservada para visualización en Power BI.")
 
     return df
-
 
 # ================================================
 # 💤 Agregar días de descanso (relleno con 0)
 # ================================================
 def agregar_dias_descanso(df_result, conn, microciclo_predicho):
-    print("🧩 Agregando días de descanso al resultado...")
+    print("🧩 Integrando días de descanso al resultado final...")
+    fecha_original = df_result["Fecha"].copy()  # 💡 guardamos la columna para restaurarla después
 
-    # 1️⃣ Detectar columnas reales en la tabla
-    columnas_query = "PRAGMA table_info(DB_MicrociclosExcel)"
-    cols = pd.read_sql(columnas_query, conn)["name"].tolist()
 
-    # 2️⃣ Determinar qué columna de tipo de día usar
-    if "Tipo_Dia" in cols:
-        col_tipo = "Tipo_Dia"
-    elif "tipo_dia_next" in cols:
-        col_tipo = "tipo_dia_next"
-    else:
-        col_tipo = None
+    # 1️⃣ Asegurar que exista la columna Fecha en df_result
+    if "Fecha_x" in df_result.columns:
+        df_result.rename(columns={"Fecha_x": "Fecha"}, inplace=True)
+    if "Fecha_y" in df_result.columns:
+        df_result.drop(columns=["Fecha_y"], inplace=True, errors="ignore")
 
-    # 3️⃣ Construir el query dinámico
-    if col_tipo:
-        query_descansos = f"""
-        SELECT Fecha, {col_tipo} AS Tipo_Dia, Intensidad
+    if "Fecha" not in df_result.columns:
+        raise ValueError("❌ df_result no contiene columna Fecha.")
+
+    df_result["Fecha"] = pd.to_datetime(df_result["Fecha"]).dt.normalize()
+
+    # 2️⃣ Cargar planificación semanal (DB_MicrociclosExcel)
+    df_plan = pd.read_sql(f"""
+        SELECT Fecha, Tipo_Dia, Intensidad
         FROM DB_MicrociclosExcel
         WHERE Microciclo_Num = {microciclo_predicho}
-        """
-    else:
-        query_descansos = f"""
-        SELECT Fecha, 'DESCANSO' AS Tipo_Dia, NULL AS Intensidad
-        FROM DB_MicrociclosExcel
-        WHERE Microciclo_Num = {microciclo_predicho}
-        """
+    """, conn)
+    df_plan["Fecha"] = pd.to_datetime(df_plan["Fecha"]).dt.normalize()
 
-    df_plan = pd.read_sql(query_descansos, conn)
-
-    # 4️⃣ Crear combinaciones jugador-fecha
+    # 3️⃣ Generar estructura base: jugador × fecha_plan
     jugadores = df_result["id_jugador"].unique()
-    dias = df_plan["Fecha"].unique()
-    combinaciones = pd.MultiIndex.from_product([jugadores, dias], names=["id_jugador", "Fecha"]).to_frame(index=False)
+    fechas_plan = df_plan["Fecha"].unique()
+    df_grid = pd.DataFrame(
+        [(j, f) for j in jugadores for f in fechas_plan],
+        columns=["id_jugador", "Fecha"]
+    )
 
-    # 5️⃣ Combinar con plan y predicciones
-    df_completo = combinaciones.merge(df_plan, on="Fecha", how="left")
-    df_final = df_completo.merge(df_result, on="id_jugador", how="left")
+    # 4️⃣ Unir planificación (Tipo_Dia, Intensidad)
+    df_final = df_grid.merge(df_plan, on="Fecha", how="left")
 
-        # 🔹 Si existe Tipo_Dia_x, lo usamos como el definitivo
-    if "Tipo_Dia_x" in df_final.columns:
-        df_final["Tipo_Dia"] = df_final["Tipo_Dia_x"]
-        df_final.drop(columns=["Tipo_Dia_x"], inplace=True, errors="ignore")
-    elif "Tipo_Dia" not in df_final.columns:
-        df_final["Tipo_Dia"] = "DESCANSO"
+    # 5️⃣ Unir predicciones por jugador y fecha (❗la corrección clave)
+    df_result["Fecha"] = pd.to_datetime(df_result["Fecha"]).dt.normalize()
+    df_final = df_final.merge(
+        df_result,
+        on=["id_jugador", "Fecha"],
+        how="left",
+        suffixes=("", "_pred")
+    )
 
-    # 🔹 Rellenar valores faltantes en Tipo_Dia
-    df_final["Tipo_Dia"] = df_final["Tipo_Dia"].fillna("DESCANSO")
-
-    # 🔹 Rellenar métricas con 0 para días sin carga o partidos
+    # 6️⃣ Rellenar días sin datos con 0 (descanso o partido)
     metricas = [
-        "Distancia_total_pred", "CE_pred", "CS_pred", "Acc_3_pred",
-        "Dec_3_pred", "HMLD_m_pred", "HSR_abs_m_pred", "Sprint_vel_max_kmh_pred"
+        "Distancia_total_pred", "CE_pred", "CS_pred",
+        "Acc_3_pred", "Dec_3_pred", "HMLD_m_pred",
+        "HSR_abs_m_pred", "Sprint_vel_max_kmh_pred"
     ]
     for m in metricas:
         if m in df_final.columns:
-            df_final.loc[df_final["Tipo_Dia"].isin(["DESCANSO", "PARTIDO"]), m] = 0
+            mask = df_final["Tipo_Dia"].isin(["DESCANSO", "PARTIDO"])
+            df_final.loc[mask, m] = 0
             df_final[m] = df_final[m].fillna(0)
 
-    # 🔹 Agregar contexto final
+    # 7️⃣ Mantener contexto y limpiar duplicados
     df_final["microciclo_next"] = microciclo_predicho
     if "tipo_semana_pred" in df_result.columns:
         df_final["tipo_semana_pred"] = df_result["tipo_semana_pred"].iloc[0]
 
-    print("✅ Días de descanso agregados correctamente.")
-    return df_final
+    # 8️⃣ Limpieza final: eliminar columnas duplicadas o *_pred innecesarias
+    drop_cols = [c for c in df_final.columns if c.endswith("_pred") and c not in metricas]
+    df_final.drop(columns=drop_cols, inplace=True, errors="ignore")
 
+    df_final = df_final.loc[:, ~df_final.columns.duplicated()]
+
+    print(f"✅ Días de descanso integrados correctamente ({len(df_final)} filas, {len(df_final['Fecha'].unique())} fechas únicas).")
+    
+    # 💾 Restaurar columna de fecha para análisis temporal
+    if "Fecha" not in df_final.columns:
+        df_final["Fecha"] = fecha_original
+
+    # 🧹 Normalizamos formato de fecha (sin hora)
+    df_final["Fecha"] = pd.to_datetime(df_final["Fecha"]).dt.date
+    print("📅 Columna Fecha normalizada (sin horas).")
+
+    print("📅 Columna Fecha preservada para visualización en Power BI.")
+    
+    return df_final
 
 
 
@@ -289,16 +422,30 @@ def ejecutar_prediccion_microciclo():
     conn = sqlite3.connect(DB_PATH)
     df_input, microciclo_actual = preparar_datos(conn)
     print(f"🎯 Prediciendo el microciclo {microciclo_actual + 1}...\n")
+    print(df_input)
+
+    print("\n🧩 Diagnóstico de duplicación en df_input:")
+    duplicados = df_input.groupby(["id_jugador", "Fecha"]).size().reset_index(name="repeticiones")
+    print(duplicados[duplicados["repeticiones"] > 1].head(10))
+    print(f"Total de combinaciones duplicadas: {len(duplicados[duplicados['repeticiones'] > 1])}")
+    print(f"Columnas actuales: {list(df_input.columns)}")
+
 
     df_result = predict_pipeline(df_input)
+
+    print(df_result.columns)
+    print("\n🔍 Chequeo de variación real entre días (post-predict):")
+    print(df_result.groupby('tipo_dia_next')[['Distancia_total_pred', 'CE_pred', 'CS_pred']].mean().round(2))
+
     df_final = agregar_dias_descanso(df_result, conn, microciclo_actual + 1)
-    
+    print(df_result.columns)
+    print(df_final["Fecha"])
     # ======================================================
     # 🧹 DEPURACIÓN FINAL DE COLUMNAS (para vista Power BI)
     # ======================================================
     columnas_finales = [
         # Identificación y contexto
-        "id_jugador", "Fecha_x", "microciclo_actual", "microciclo_next",
+        "id_jugador", "Fecha", "microciclo_actual", "microciclo_next",
 
         # Planificación semanal
         "Tipo_Dia", "Intensidad", "entrenos_total_next", "descansos_total_next",

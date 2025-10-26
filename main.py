@@ -33,7 +33,7 @@ def main():
     if not cargar_jugadores(etl, rutas['JUGADORES_XLSX']):
         return
     etl.validar_aliases()
-
+    
     # 2️⃣ Lesiones
     ruta_lesiones = Path("data/raw/lesiones/lesiones_musculares.xlsx")
     if ruta_lesiones.exists():
