@@ -445,7 +445,7 @@ def ejecutar_prediccion_microciclo():
     # ======================================================
     columnas_finales = [
         # Identificación y contexto
-        "id_jugador", "Fecha", "microciclo_actual", "microciclo_next",
+        "id_jugador", "Fecha", "microciclo_actual", "microciclo_next",'tipo_semana_next',
 
         # Planificación semanal
         "Tipo_Dia", "Intensidad", "entrenos_total_next", "descansos_total_next",
@@ -464,6 +464,9 @@ def ejecutar_prediccion_microciclo():
 
     # Eliminar duplicadas o antiguas
     df_final = df_final.loc[:, ~df_final.columns.duplicated()]
+
+    #Reemplazamos valores numéricos por categóricos:
+    df_final['tipo_semana_next'] = df_final['tipo_semana_next'].replace({0: 'BAJA', 1: 'MEDIA', 2: 'ALTA'})
 
     # Renombrar columnas para consistencia
     df_final.rename(columns={
