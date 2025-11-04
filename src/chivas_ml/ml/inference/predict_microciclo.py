@@ -5,6 +5,7 @@ import os
 import sqlite3
 import pandas as pd
 import joblib
+import numpy as np
 
 # ================================================
 # 📁 Configuración de rutas
@@ -188,7 +189,7 @@ def preparar_datos(conn):
 # ================================================
 def predict_pipeline(df):
     print("🚀 Iniciando flujo de predicción jerárquica...\n")
-    fecha_original = df["Fecha"].copy()  # 💡 guardamos la columna para restaurarla después
+    fecha_original = df["Fecha"].copy()
 
     # 1️⃣ Predicción tipo de semana
     folder = "modelo_clas_carga_semanal"
@@ -204,10 +205,8 @@ def predict_pipeline(df):
     ]
     X_semana = df[FEATURES_SEMANA]
     df["tipo_semana_pred"] = model.predict(scaler.transform(X_semana))
-    print("✅ Tipo de semana predicha")
-
-    # 🔄 Compatibilidad con entrenamiento
     df["tipo_semana_next"] = df["tipo_semana_pred"]
+    print("✅ Tipo de semana predicha")
 
     # 2️⃣ Predicción Distancia total
     folder = "modelo_clas_distancia_total"
@@ -226,17 +225,11 @@ def predict_pipeline(df):
     ] + [c for c in df.columns if c.startswith('Pos_') or c.startswith('Lin_')]
 
     X_dist = df[[c for c in FEATURES_DIST if c in df.columns]].copy()
-    if 'tipo_semana_pred' in X_dist.columns:
-        X_dist = X_dist.drop(columns=['tipo_semana_pred'])
-
-    # 🔧 Compatibilidad total con el scaler
     expected_cols = list(scaler.feature_names_in_)
     for c in expected_cols:
         if c not in X_dist.columns:
             X_dist[c] = 0.0
     X_dist = X_dist[expected_cols]
-
-    print(f"✅ Columnas ajustadas al scaler ({len(expected_cols)} features).")
 
     df["Distancia_total_pred"] = model.predict(scaler.transform(X_dist))
     print("✅ Distancia total predicha")
@@ -247,8 +240,6 @@ def predict_pipeline(df):
         ("CS", "modelo_clas_CS", "model_rf_CS_tendencias.pkl", "scaler_CS.pkl")
     ]:
         model, scaler = load_model(os.path.join(REGISTRY_DIR, folder), m, s)
-
-        df["tipo_semana_next"] = df["tipo_semana_pred"]
         df["Distancia_total"] = df["Distancia_total_pred"]
 
         FEATURES_CARGAS = [
@@ -261,26 +252,43 @@ def predict_pipeline(df):
         ] + [c for c in df.columns if c.startswith('Pos_') or c.startswith('Lin_')]
 
         X_cargas = df[[c for c in FEATURES_CARGAS if c in df.columns]].copy()
-        for col in ['tipo_semana_pred', 'Distancia_total_pred']:
-            if col in X_cargas.columns:
-                X_cargas = X_cargas.drop(columns=[col])
-
-        # 🔧 Ajustar columnas al scaler dentro del bucle
         expected_cols = list(scaler.feature_names_in_)
         for c in expected_cols:
             if c not in X_cargas.columns:
                 X_cargas[c] = 0.0
         X_cargas = X_cargas[expected_cols]
-
         df[f"{name}_pred"] = model.predict(scaler.transform(X_cargas))
-        print(f"✅ {name} predicho con {len(expected_cols)} features validados.")
+        print(f"✅ {name} predicha correctamente")
 
-    print("✅ Cargas CE y CS predichas")
+    # ⚙️ Ajuste fisiológico post-predicción
+    print("\n🧠 Aplicando ajuste fisiológico por riesgo o carga alta...")
+    df["ajuste_por_riesgo"] = (
+        (df["CT_total_actual"] > 850) | (df["riesgo_suavizado_3d_actual"] > 0.7)
+    ).astype(int)
 
-    # 4️⃣ Predicción de métricas micro (Acc, Dec, HMLD, HSR, Sprint)
-    print("🔄 Iniciando predicción de métricas micro...")
-    df["tipo_semana_next"] = df["tipo_semana_pred"]
-    df["Distancia_total"] = df["Distancia_total_pred"]
+    for var, factor in {
+        "Distancia_total_pred": 0.95,
+        "CE_pred": 0.9,
+        "CS_pred": 0.9,
+    }.items():
+        df[var] = np.where(df["ajuste_por_riesgo"] == 1, df[var] * factor, df[var])
+
+    print("✅ Ajuste fisiológico aplicado correctamente.")
+
+    # ⚖️ Ajuste de continuidad semanal por jugador (máx +10% sobre su promedio actual)
+    print("\n⚖️ Aplicando ajuste de continuidad fisiológica por jugador...")
+    for var in ["Distancia_total_pred", "CE_pred", "CS_pred"]:
+        base_var = var.replace("_pred", "_actual")
+        if base_var in df.columns:
+            limites = (
+                df.groupby("id_jugador")[base_var]
+                .transform(lambda x: x.mean() * 1.10)
+            )
+            df[var] = np.where(df[var] > limites, limites, df[var])
+    print("✅ Ajuste de continuidad individual aplicado correctamente.")
+
+
+    # 4️⃣ Predicción de métricas micro
     df["Carga_Explosiva"] = df["CE_pred"]
     df["Carga_Sostenida"] = df["CS_pred"]
 
@@ -294,7 +302,6 @@ def predict_pipeline(df):
 
     for col, (folder, model_name, scaler_name) in micro_models.items():
         model, scaler = load_model(os.path.join(REGISTRY_DIR, folder), model_name, scaler_name)
-
         FEATURES_MICRO = [
             'tipo_semana_next', 'tipo_dia_next', 'Carga_Explosiva', 'Carga_Sostenida', 'Distancia_total',
             'CT_total_actual', 'CE_total_actual', 'CS_total_actual', 'CR_total_actual',
@@ -305,28 +312,18 @@ def predict_pipeline(df):
         ] + [c for c in df.columns if c.startswith('Pos_') or c.startswith('Lin_')]
 
         X_micro = df[[c for c in FEATURES_MICRO if c in df.columns]].copy()
-        for col_drop in ['tipo_semana_pred', 'Distancia_total_pred', 'CE_pred', 'CS_pred']:
-            if col_drop in X_micro.columns:
-                X_micro = X_micro.drop(columns=[col_drop])
-
-        # 🔧 Ajustar columnas al scaler dentro del bucle
         expected_cols = list(scaler.feature_names_in_)
         for c in expected_cols:
             if c not in X_micro.columns:
                 X_micro[c] = 0.0
         X_micro = X_micro[expected_cols]
-
         df[f"{col}_pred"] = model.predict(scaler.transform(X_micro))
-        print(f"✅ {col} predicho correctamente ({len(expected_cols)} features validados).")
+        print(f"✅ {col} predicha correctamente")
 
-    print("✅ Métricas micro predichas correctamente")
-
-    # 💾 Restaurar columna de fecha para análisis temporal
-    if "Fecha" not in df.columns:
-        df["Fecha"] = fecha_original
+    df["Fecha"] = pd.to_datetime(fecha_original).dt.date
     print("📅 Columna Fecha preservada para visualización en Power BI.")
-
     return df
+
 
 # ================================================
 # 💤 Agregar días de descanso (relleno con 0)
